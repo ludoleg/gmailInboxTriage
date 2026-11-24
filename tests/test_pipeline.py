@@ -1,19 +1,23 @@
-"""Unit tests for TriageOrchestrator multi-model routing, fallback, and cloud guardrails."""
+"""Unit tests for the concurrent 3-tier TriageOrchestrator pipeline."""
 
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+
+from google.genai import types
+from pydantic import BaseModel
 
 from inbox_triage.config import Settings
 from inbox_triage.models import (
     AttachmentKind,
-    CloudEscalationResult,
     DeepThreadAnalysis,
     EmailAttachment,
+    EmailThread,
     ExecutiveBriefing,
+    HighStakesReview,
     ModelCallStats,
-    MultimodalFinding,
     Stage1Classification,
     TechExtraction,
     TriageCategory,
@@ -22,472 +26,441 @@ from inbox_triage.pipeline.orchestrator import TriageOrchestrator
 from tests.conftest import make_email_thread
 
 
-def _make_fake_lease(*, acquire_inkling_result: bool = True) -> MagicMock:
-    lease = MagicMock()
-    lease.__enter__.return_value = lease
-    lease.__exit__.return_value = None
-    lease.acquire_inkling.return_value = acquire_inkling_result
-    return lease
+@dataclass
+class RecordedCall:
+    model: str
+    stage: str
+    contents: Any
+    response_schema: type[BaseModel]
+    temperature: float
+    max_output_tokens: int
 
 
-def _stats(backend: str, model: str, stage: str) -> ModelCallStats:
-    return ModelCallStats(
-        backend=backend,  # type: ignore[arg-type]
-        model=model,
-        stage=stage,
-        prompt_tokens=100,
-        completion_tokens=40,
-        latency_ms=120.0,
-    )
+class FakeGenAIRouter:
+    """Thread-safe stub implementing GenAIRouter.generate_structured for pipeline tests."""
+
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        self._lock = threading.Lock()
+        self.calls: list[RecordedCall] = []
+
+    def generate_structured(
+        self,
+        *,
+        model: str,
+        stage: str,
+        system_prompt: str,
+        contents: Any,
+        response_schema: type[BaseModel],
+        temperature: float = 0.1,
+        max_output_tokens: int = 2048,
+        max_retries: int = 3,
+    ) -> tuple[Any, ModelCallStats]:
+        call = RecordedCall(
+            model=model,
+            stage=stage,
+            contents=contents,
+            response_schema=response_schema,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        with self._lock:
+            self.calls.append(call)
+        result = self._handler(call)
+        stats = ModelCallStats(
+            backend="vertexai",
+            model=model,
+            stage=stage,
+            prompt_tokens=150,
+            completion_tokens=60,
+            latency_ms=42.0,
+        )
+        return result, stats
 
 
-def test_inbox_zero_short_circuit_zero_gpu_switches_zero_llm_calls(test_settings: Settings) -> None:
-    router = MagicMock()
-    lease = _make_fake_lease()
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-
-    report = orchestrator.run([])
-
-    assert report.total_threads_fetched == 0
-    assert report.triaged_threads == []
-    assert report.used_inkling is False
-    assert report.used_ollama_multimodal is False
-    assert report.used_ollama_fallback is False
-    assert lease.__enter__.call_count == 0
-    assert lease.acquire_ollama.call_count == 0
-    assert lease.acquire_inkling.call_count == 0
-    assert router.generate_structured.call_count == 0
+def _extract_prompt_text(contents: Any) -> str:
+    if isinstance(contents, str):
+        return contents
+    if isinstance(contents, list):
+        return "\n".join(c for c in contents if isinstance(c, str))
+    return str(contents)
 
 
-def test_text_only_inbox_skips_ollama_and_runs_inkling_stages_1_to_3(test_settings: Settings) -> None:
-    threads = [
-        make_email_thread(thread_id="t-ci", subject="[repo] CI failed", sender_email="ci@github.com"),
-        make_email_thread(thread_id="t-action", subject="Approve Q2 budget", sender_email="cfo@acme.example"),
-        make_email_thread(thread_id="t-promo", subject="50% off shoes!", has_list_unsubscribe=True),
-    ]
-    calls: list[dict[str, Any]] = []
+class TestTriageOrchestrator:
+    def test_inbox_zero_short_circuits_with_zero_llm_calls(self, test_settings: Settings) -> None:
+        router = FakeGenAIRouter(handler=lambda _c: (_ for _ in ()).throw(AssertionError("Must not call LLM")))
+        orchestrator = TriageOrchestrator(settings=test_settings, router=router)  # type: ignore[arg-type]
 
-    def fake_generate(**kwargs: Any) -> tuple[Any, ModelCallStats]:
-        calls.append(kwargs)
-        stage = kwargs["stage"]
-        contents = str(kwargs["contents"])
-        if stage == "stage1_triage":
-            if "t-ci" in contents:
-                return (
-                    Stage1Classification(
-                        category=TriageCategory.TECHNICAL_ALERT,
+        report = orchestrator.run([])
+
+        assert router.calls == []
+        assert report.total_threads_fetched == 0
+        assert report.triaged_threads == []
+        assert report.briefing is None
+        assert report.deep_reviews_count == 0
+        assert report.call_stats == []
+
+    def test_full_three_tier_funnel_with_multimodal_parts_and_noise_filtering(
+        self,
+        test_settings: Settings,
+        synthetic_inbox_threads: list[EmailThread],
+        tiny_png_bytes: bytes,
+        tiny_wav_bytes: bytes,
+        tiny_pdf_bytes: bytes,
+    ) -> None:
+        def _handler(call: RecordedCall) -> BaseModel:
+            text = _extract_prompt_text(call.contents)
+
+            if call.stage == "stage1_fast_triage":
+                if "thr-urgent-receipt" in text:
+                    return Stage1Classification(
+                        category=TriageCategory.URGENT,
                         confidence=0.95,
-                        one_line_summary="CI failed on main",
-                        needs_tech_extract=True,
-                        needs_deep_analysis=False,
-                        reason="CI alert",
-                    ),
-                    _stats(kwargs["backend"], kwargs["model"], stage),
-                )
-            if "t-action" in contents:
-                return (
-                    Stage1Classification(
-                        category=TriageCategory.ACTION_REQUIRED,
-                        confidence=0.92,
-                        one_line_summary="Approve Q2 budget",
+                        one_line_summary="Overdue hosting invoice due at 5 PM PT.",
                         needs_tech_extract=False,
                         needs_deep_analysis=True,
-                        reason="Requires approval",
-                    ),
-                    _stats(kwargs["backend"], kwargs["model"], stage),
-                )
-            return (
-                Stage1Classification(
-                    category=TriageCategory.PROMO_NOISE,
-                    confidence=0.99,
-                    one_line_summary="Shoe sale promo",
-                    needs_tech_extract=False,
-                    needs_deep_analysis=False,
-                    reason="Marketing",
-                ),
-                _stats(kwargs["backend"], kwargs["model"], stage),
-            )
-        if stage == "stage2_tech_extract":
-            return (
-                TechExtraction(
-                    source_system="GitHub",
-                    severity="high",
-                    repo_or_service="acme/repo",
-                    error_or_event="pytest failed",
-                ),
-                _stats(kwargs["backend"], kwargs["model"], stage),
-            )
-        if stage == "stage2_deep_analysis":
-            return (
-                DeepThreadAnalysis(
-                    refined_category=TriageCategory.ACTION_REQUIRED,
-                    confidence=0.93,
-                    summary="CFO asks to approve Q2 budget by Friday.",
-                    action_items=["Approve Q2 budget"],
-                    deadline="Friday",
-                ),
-                _stats(kwargs["backend"], kwargs["model"], stage),
-            )
-        if stage == "stage3_executive_synthesis":
-            return (
-                ExecutiveBriefing(
-                    headline="1 CI failure and 1 budget approval",
-                    executive_summary="Review CI failure and approve Q2 budget.",
-                    top_priority_thread_ids=["t-action", "t-ci"],
-                ),
-                _stats(kwargs["backend"], kwargs["model"], stage),
-            )
-        raise AssertionError(f"Unexpected stage: {stage}")
-
-    router = MagicMock()
-    router.cloud_client = None
-    router.generate_structured.side_effect = fake_generate
-    lease = _make_fake_lease(acquire_inkling_result=True)
-
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-    report = orchestrator.run(threads, allow_cloud=False)
-
-    assert report.used_ollama_multimodal is False
-    assert report.used_inkling is True
-    assert report.used_ollama_fallback is False
-    lease.acquire_ollama.assert_not_called()
-    lease.acquire_inkling.assert_called_once()
-
-    # Verify reasoning_effort progression: none -> low -> medium
-    s1_calls = [c for c in calls if c["stage"] == "stage1_triage"]
-    s2_calls = [c for c in calls if c["stage"].startswith("stage2_")]
-    s3_calls = [c for c in calls if c["stage"] == "stage3_executive_synthesis"]
-
-    assert len(s1_calls) == 3
-    assert all(c["backend"] == "inkling" and c["reasoning_effort"] == "none" for c in s1_calls)
-    assert len(s2_calls) == 2  # promo was dropped before Stage 2
-    assert all(c["backend"] == "inkling" and c["reasoning_effort"] == "low" for c in s2_calls)
-    assert len(s3_calls) == 1
-    assert s3_calls[0]["backend"] == "inkling"
-    assert s3_calls[0]["reasoning_effort"] == "medium"
-    assert "t-promo" not in str(s3_calls[0]["contents"])
-
-
-def test_multimodal_inbox_runs_phase_a_gemma4_12b_then_unloads_then_inkling(
-    test_settings: Settings, tiny_png_bytes: bytes, tiny_wav_bytes: bytes
-) -> None:
-    mm_thread = make_email_thread(
-        thread_id="t-mm",
-        subject="Receipt and voicemail",
-        attachments=[
-            EmailAttachment(
-                filename="receipt.png",
-                mime_type="image/png",
-                kind=AttachmentKind.IMAGE,
-                size_bytes=len(tiny_png_bytes),
-                data_bytes=tiny_png_bytes,
-            ),
-            EmailAttachment(
-                filename="vm.wav",
-                mime_type="audio/wav",
-                kind=AttachmentKind.AUDIO,
-                size_bytes=len(tiny_wav_bytes),
-                data_bytes=tiny_wav_bytes,
-            ),
-        ],
-    )
-    calls: list[dict[str, Any]] = []
-
-    def fake_generate(**kwargs: Any) -> tuple[Any, ModelCallStats]:
-        calls.append(kwargs)
-        stage = kwargs["stage"]
-        if stage == "phase_a_multimodal":
-            fname = "receipt.png" if "receipt.png" in str(kwargs["contents"][0]) else "vm.wav"
-            return (
-                MultimodalFinding(
-                    filename=fname,
-                    summary=f"Extracted from {fname}",
-                    extracted_key_facts=["$480 due"],
-                    urgency_signal="high",
-                ),
-                _stats("ollama", kwargs["model"], stage),
-            )
-        if stage == "stage1_triage":
-            return (
-                Stage1Classification(
-                    category=TriageCategory.URGENT,
-                    confidence=0.95,
-                    one_line_summary="Urgent receipt + voicemail",
+                        reason="Service suspension deadline today.",
+                    )
+                if "thr-ci-failure" in text:
+                    return Stage1Classification(
+                        category=TriageCategory.TECHNICAL_ALERT,
+                        confidence=0.98,
+                        one_line_summary="CI failed on acme/payments-api main.",
+                        needs_tech_extract=True,
+                        needs_deep_analysis=False,
+                        reason="GitHub Actions failure notification.",
+                    )
+                if "thr-promo-sale" in text:
+                    return Stage1Classification(
+                        category=TriageCategory.PROMO_NOISE,
+                        confidence=0.99,
+                        one_line_summary="40% off ergonomic chairs sale.",
+                        reason="Promotional marketing email.",
+                    )
+                if "thr-newsletter" in text:
+                    return Stage1Classification(
+                        category=TriageCategory.NEWSLETTER,
+                        confidence=0.97,
+                        one_line_summary="Weekly Cloud Digest #88.",
+                        reason="Subscribed weekly newsletter.",
+                    )
+                return Stage1Classification(
+                    category=TriageCategory.ACTION_REQUIRED,
+                    confidence=0.62,  # Below 0.70 threshold -> triggers Stage 3 HighStakesReview
+                    one_line_summary="Confirm Q2 roadmap review time tomorrow.",
                     needs_deep_analysis=True,
-                    reason="Urgent attachment",
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        if stage == "stage2_deep_analysis":
-            return (
-                DeepThreadAnalysis(
-                    refined_category=TriageCategory.URGENT,
-                    confidence=0.95,
-                    summary="Pay $480 today.",
-                    action_items=["Pay invoice"],
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        return (
-            ExecutiveBriefing(headline="1 urgent item", executive_summary="Pay $480 today."),
-            _stats("inkling", kwargs["model"], stage),
+                    reason="Partner requests time confirmation.",
+                )
+
+            if call.stage == "stage2_tech_extract":
+                return TechExtraction(
+                    source_system="GitHub Actions",
+                    severity="high",
+                    repo_or_service="acme/payments-api",
+                    error_or_event="AssertionError in test_idempotency on main",
+                    action_url="https://github.com/acme/payments-api/actions/runs/987654321",
+                )
+
+            if call.stage == "stage2_deep_multimodal":
+                if "thr-urgent-receipt" in text:
+                    return DeepThreadAnalysis(
+                        refined_category=TriageCategory.URGENT,
+                        confidence=0.94,
+                        summary="Pay $480.00 CloudHost invoice #INV-9921 before 5 PM PT today.",
+                        action_items=["Update payment method on CloudHost", "Confirm invoice #INV-9921"],
+                        deadline="Today 5:00 PM PT",
+                        attachment_findings=[
+                            "receipt.png shows $480.00 balance",
+                            "voicemail.wav confirms 5 PM cutoff",
+                            "statement.pdf lists invoice #INV-9921",
+                        ],
+                        suggested_reply_points=["Payment updated, please confirm receipt"],
+                        deep_review_recommended=True,
+                        deep_review_reason="Production suspension risk.",
+                    )
+                return DeepThreadAnalysis(
+                    refined_category=TriageCategory.ACTION_REQUIRED,
+                    confidence=0.65,
+                    summary="Confirm 10 AM or 2 PM PT tomorrow for Q2 roadmap review.",
+                    action_items=["Reply to Maya with preferred slot"],
+                    deadline="End of day",
+                )
+
+            if call.stage == "stage3_executive_synthesis":
+                return ExecutiveBriefing(
+                    headline="Hosting suspension risk today + broken CI on payments-api.",
+                    executive_summary="Resolve the overdue CloudHost invoice first, then fix CI and reply to Maya.",
+                    top_priority_thread_ids=["thr-urgent-receipt", "thr-ci-failure", "thr-action-meeting"],
+                    cross_thread_connections=[],
+                    deep_review_thread_ids=["thr-urgent-receipt"],
+                )
+
+            if call.stage == "stage3_high_stakes_review":
+                if "thr-urgent-receipt" in text:
+                    return HighStakesReview(
+                        refined_category=TriageCategory.URGENT,
+                        executive_summary="Immediate payment of $480.00 required before 5 PM PT to prevent cluster suspension.",
+                        action_items=["Pay invoice #INV-9921 immediately"],
+                        deadline="Today 5:00 PM PT",
+                        risk_assessment="Production outage if unpaid by 5 PM PT.",
+                        suggested_next_step="Log into CloudHost billing portal and settle #INV-9921 now.",
+                    )
+                return HighStakesReview(
+                    refined_category=TriageCategory.ACTION_REQUIRED,
+                    executive_summary="Confirm tomorrow's Q2 roadmap review slot with Maya.",
+                    action_items=["Pick 10 AM or 2 PM PT"],
+                    deadline="End of day",
+                    risk_assessment="Scheduling delay with partner.",
+                    suggested_next_step="Reply confirming 10 AM PT.",
+                )
+
+            raise AssertionError(f"Unexpected stage: {call.stage}")
+
+        router = FakeGenAIRouter(handler=_handler)
+        orchestrator = TriageOrchestrator(settings=test_settings, router=router)  # type: ignore[arg-type]
+
+        report = orchestrator.run(synthetic_inbox_threads)
+
+        # Input order is preserved despite concurrent Stage 1 execution
+        assert [t.thread.thread_id for t in report.triaged_threads] == [
+            t.thread_id for t in synthetic_inbox_threads
+        ]
+
+        # Stage 1: all 5 threads classified by gemini-3.5-flash-lite
+        s1_calls = [c for c in router.calls if c.stage == "stage1_fast_triage"]
+        assert len(s1_calls) == 5
+        assert all(c.model == "gemini-3.5-flash-lite" for c in s1_calls)
+
+        # Stage 2: noise (promo + newsletter) dropped; only CI gets tech_extract; urgent + action get deep_multimodal
+        tech_calls = [c for c in router.calls if c.stage == "stage2_tech_extract"]
+        deep_calls = [c for c in router.calls if c.stage == "stage2_deep_multimodal"]
+        assert len(tech_calls) == 1
+        assert tech_calls[0].model == "gemini-4-carbon"
+        assert "thr-ci-failure" in _extract_prompt_text(tech_calls[0].contents)
+
+        assert len(deep_calls) == 2
+        assert all(c.model == "gemini-4-carbon" for c in deep_calls)
+        for c in deep_calls:
+            txt = _extract_prompt_text(c.contents)
+            assert "thr-promo-sale" not in txt
+            assert "thr-newsletter" not in txt
+
+        # Verify native multimodal types.Part passed for image, audio, AND PDF on urgent thread
+        urgent_deep_call = next(c for c in deep_calls if "thr-urgent-receipt" in _extract_prompt_text(c.contents))
+        assert isinstance(urgent_deep_call.contents, list)
+        parts = [p for p in urgent_deep_call.contents if isinstance(p, types.Part)]
+        assert len(parts) == 3
+        part_map = {p.inline_data.mime_type: p.inline_data.data for p in parts}  # type: ignore[union-attr]
+        assert part_map == {
+            "image/png": tiny_png_bytes,
+            "audio/wav": tiny_wav_bytes,
+            "application/pdf": tiny_pdf_bytes,
+        }
+
+        # Stage 3: gemini-4-neon with max_output_tokens=8192 for both synthesis and high-stakes review
+        synth_calls = [c for c in router.calls if c.stage == "stage3_executive_synthesis"]
+        assert len(synth_calls) == 1
+        assert synth_calls[0].model == "gemini-4-neon"
+        assert synth_calls[0].max_output_tokens == 8192
+
+        review_calls = [c for c in router.calls if c.stage == "stage3_high_stakes_review"]
+        assert len(review_calls) == 2  # urgent (flagged) + action (confidence 0.65 < 0.70)
+        assert all(c.model == "gemini-4-neon" for c in review_calls)
+        assert all(c.max_output_tokens == 8192 for c in review_calls)
+
+        # Verify Stage 3 HighStakesReview also passes multimodal Parts for urgent thread
+        urgent_review_call = next(
+            c for c in review_calls if "thr-urgent-receipt" in _extract_prompt_text(c.contents)
+        )
+        assert len([p for p in urgent_review_call.contents if isinstance(p, types.Part)]) == 3
+
+        assert report.deep_reviews_count == 2
+        by_id = {t.thread.thread_id: t for t in report.triaged_threads}
+        assert by_id["thr-urgent-receipt"].deep_review_model == "gemini-4-neon"
+        assert by_id["thr-urgent-receipt"].high_stakes_review is not None
+        assert by_id["thr-urgent-receipt"].confidence >= 0.95
+        assert by_id["thr-ci-failure"].tech_extraction is not None
+        assert by_id["thr-promo-sale"].deep_analysis is None
+        assert by_id["thr-newsletter"].deep_analysis is None
+        assert report.briefing is not None
+        assert "Hosting suspension" in report.briefing.headline
+
+    def test_fyi_thread_with_multimodal_attachment_still_gets_stage2_deep_analysis(
+        self, test_settings: Settings, tiny_pdf_bytes: bytes
+    ) -> None:
+        thread = make_email_thread(
+            thread_id="thr-fyi-pdf",
+            subject="Updated Benefit Summary PDF",
+            attachments=[
+                EmailAttachment(
+                    filename="benefits.pdf",
+                    mime_type="application/pdf",
+                    kind=AttachmentKind.PDF,
+                    size_bytes=len(tiny_pdf_bytes),
+                    data_bytes=tiny_pdf_bytes,
+                )
+            ],
         )
 
-    router = MagicMock()
-    router.cloud_client = None
-    router.generate_structured.side_effect = fake_generate
-    lease = _make_fake_lease(acquire_inkling_result=True)
-
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-    report = orchestrator.run([mm_thread], allow_cloud=False)
-
-    assert report.used_ollama_multimodal is True
-    assert report.used_inkling is True
-    lease.acquire_ollama.assert_called_once()
-    router.unload_ollama_model.assert_called_once_with(test_settings.model_multimodal)
-    lease.acquire_inkling.assert_called_once()
-
-    mm_calls = [c for c in calls if c["stage"] == "phase_a_multimodal"]
-    assert len(mm_calls) == 2
-    # Image uses think=True, audio uses think=False
-    assert mm_calls[0]["model"] == "gemma4:12b"
-    assert mm_calls[0]["think"] is True
-    assert mm_calls[1]["model"] == "gemma4:12b"
-    assert mm_calls[1]["think"] is False
-
-    # Stage 1 prompt receives multimodal findings
-    s1_call = next(c for c in calls if c["stage"] == "stage1_triage")
-    assert "Extracted from receipt.png" in str(s1_call["contents"])
-    assert "Extracted from vm.wav" in str(s1_call["contents"])
-    assert len(report.triaged_threads[0].multimodal_findings) == 2
-
-
-def test_inkling_unavailable_falls_back_to_ollama_models_with_unloads(test_settings: Settings) -> None:
-    threads = [
-        make_email_thread(thread_id="t-ci", subject="CI alert"),
-        make_email_thread(thread_id="t-urgent", subject="Urgent request"),
-    ]
-    calls: list[dict[str, Any]] = []
-
-    def fake_generate(**kwargs: Any) -> tuple[Any, ModelCallStats]:
-        calls.append(kwargs)
-        stage = kwargs["stage"]
-        if stage == "stage1_triage":
-            if "t-ci" in str(kwargs["contents"]):
-                return (
-                    Stage1Classification(
-                        category=TriageCategory.TECHNICAL_ALERT,
-                        confidence=0.9,
-                        one_line_summary="CI failed",
-                        needs_tech_extract=True,
-                        reason="CI",
-                    ),
-                    _stats("ollama", kwargs["model"], stage),
+        def _handler(call: RecordedCall) -> BaseModel:
+            if call.stage == "stage1_fast_triage":
+                return Stage1Classification(
+                    category=TriageCategory.FYI,
+                    confidence=0.90,
+                    one_line_summary="Benefits summary attached.",
+                    needs_deep_analysis=False,
+                    reason="Informational HR update.",
                 )
-            return (
-                Stage1Classification(
+            if call.stage == "stage2_deep_multimodal":
+                return DeepThreadAnalysis(
+                    refined_category=TriageCategory.FYI,
+                    confidence=0.92,
+                    summary="Updated 2026 benefits summary PDF.",
+                    attachment_findings=["Deductible unchanged"],
+                )
+            return ExecutiveBriefing(
+                headline="One FYI update.",
+                executive_summary="HR sent updated benefits PDF.",
+            )
+
+        router = FakeGenAIRouter(handler=_handler)
+        report = TriageOrchestrator(settings=test_settings, router=router).run([thread])  # type: ignore[arg-type]
+
+        deep_calls = [c for c in router.calls if c.stage == "stage2_deep_multimodal"]
+        assert len(deep_calls) == 1
+        assert any(isinstance(p, types.Part) for p in deep_calls[0].contents)
+        assert report.triaged_threads[0].deep_analysis is not None
+
+    def test_all_noise_threads_skip_stage2_and_stage3_llm_calls(
+        self, test_settings: Settings
+    ) -> None:
+        threads = [
+            make_email_thread(thread_id="t-promo", subject="Buy now!"),
+            make_email_thread(thread_id="t-news", subject="Weekly digest"),
+        ]
+
+        def _handler(call: RecordedCall) -> BaseModel:
+            assert call.stage == "stage1_fast_triage"
+            cat = TriageCategory.PROMO_NOISE if "t-promo" in str(call.contents) else TriageCategory.NEWSLETTER
+            return Stage1Classification(
+                category=cat,
+                confidence=0.98,
+                one_line_summary="Noise",
+                reason="Noise",
+            )
+
+        router = FakeGenAIRouter(handler=_handler)
+        report = TriageOrchestrator(settings=test_settings, router=router).run(threads)  # type: ignore[arg-type]
+
+        assert len(router.calls) == 2
+        assert report.briefing is not None
+        assert "Quiet inbox" in report.briefing.headline
+        assert report.deep_reviews_count == 0
+
+    def test_enforces_max_deep_reviews_per_run_cap(self, test_settings: Settings) -> None:
+        capped_settings = test_settings.model_copy(update={"max_deep_reviews_per_run": 2})
+        threads = [make_email_thread(thread_id=f"thr-{i}", subject=f"Urgent {i}") for i in range(4)]
+
+        def _handler(call: RecordedCall) -> BaseModel:
+            if call.stage == "stage1_fast_triage":
+                return Stage1Classification(
                     category=TriageCategory.URGENT,
-                    confidence=0.9,
+                    confidence=0.50,
+                    one_line_summary="Ambiguous urgent email",
+                    needs_deep_analysis=True,
+                    reason="Low confidence",
+                )
+            if call.stage == "stage2_deep_multimodal":
+                return DeepThreadAnalysis(
+                    refined_category=TriageCategory.URGENT,
+                    confidence=0.55,
+                    summary="Still ambiguous",
+                    deep_review_recommended=True,
+                    deep_review_reason="Needs Neon",
+                )
+            if call.stage == "stage3_executive_synthesis":
+                return ExecutiveBriefing(
+                    headline="Four urgent threads.",
+                    executive_summary="All four need review.",
+                    deep_review_thread_ids=[f"thr-{i}" for i in range(4)],
+                )
+            return HighStakesReview(
+                refined_category=TriageCategory.URGENT,
+                executive_summary="Reviewed by Neon.",
+                risk_assessment="High",
+                suggested_next_step="Respond promptly.",
+            )
+
+        router = FakeGenAIRouter(handler=_handler)
+        report = TriageOrchestrator(settings=capped_settings, router=router).run(threads)  # type: ignore[arg-type]
+
+        review_calls = [c for c in router.calls if c.stage == "stage3_high_stakes_review"]
+        assert len(review_calls) == 2
+        assert report.deep_reviews_count == 2
+
+    def test_per_thread_fault_isolation_across_stages(self, test_settings: Settings) -> None:
+        threads = [
+            make_email_thread(thread_id="thr-s1-boom", subject="Malformed"),
+            make_email_thread(thread_id="thr-s2-boom", subject="Stage 2 fails"),
+            make_email_thread(thread_id="thr-healthy", subject="Healthy urgent"),
+        ]
+
+        def _handler(call: RecordedCall) -> BaseModel:
+            text = _extract_prompt_text(call.contents)
+            if call.stage == "stage1_fast_triage":
+                if "thr-s1-boom" in text:
+                    raise RuntimeError("Transient Stage 1 failure")
+                return Stage1Classification(
+                    category=TriageCategory.URGENT,
+                    confidence=0.60,
                     one_line_summary="Urgent item",
                     needs_deep_analysis=True,
                     reason="Urgent",
-                ),
-                _stats("ollama", kwargs["model"], stage),
-            )
-        if stage == "stage2_tech_extract":
-            return (
-                TechExtraction(source_system="GitHub", severity="high", error_or_event="Build failed"),
-                _stats("ollama", kwargs["model"], stage),
-            )
-        if stage == "stage2_deep_analysis":
-            return (
-                DeepThreadAnalysis(
+                )
+            if call.stage == "stage2_deep_multimodal":
+                if "thr-s2-boom" in text:
+                    raise RuntimeError("Stage 2 exploded")
+                return DeepThreadAnalysis(
                     refined_category=TriageCategory.URGENT,
                     confidence=0.92,
-                    summary="Act immediately.",
-                ),
-                _stats("ollama", kwargs["model"], stage),
-            )
-        return (
-            ExecutiveBriefing(headline="Fallback brief", executive_summary="2 items."),
-            _stats("ollama", kwargs["model"], stage),
-        )
-
-    router = MagicMock()
-    router.cloud_client = None
-    router.generate_structured.side_effect = fake_generate
-    lease = _make_fake_lease(acquire_inkling_result=False)
-
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-    report = orchestrator.run(threads, allow_cloud=False)
-
-    assert report.used_inkling is False
-    assert report.used_ollama_fallback is True
-    lease.acquire_ollama.assert_called_once()
-
-    stage_models = [(c["stage"], c["model"]) for c in calls]
-    assert ("stage1_triage", "gemma4:e2b") in stage_models
-    assert ("stage2_tech_extract", "qwen2.5-coder:3b") in stage_models
-    assert ("stage2_deep_analysis", "gemma4:12b") in stage_models
-    assert ("stage3_executive_synthesis", "bonsai-2:27b") in stage_models
-
-    # All 4 fallback models unloaded sequentially between stages
-    unloaded = [call.args[0] for call in router.unload_ollama_model.call_args_list]
-    assert unloaded == ["gemma4:e2b", "qwen2.5-coder:3b", "gemma4:12b", "bonsai-2:27b"]
-
-
-def test_phase_c_cloud_routing_denylist_and_budget_cap(test_settings: Settings) -> None:
-    test_settings.inkling_overflow_chars = 100
-    test_settings.max_cloud_escalations_per_run = 2
-    test_settings.cloud_denylist_domains = "bank.example"
-
-    threads = [
-        # 1. Denylisted domain + low confidence -> MUST be blocked
-        make_email_thread(
-            thread_id="t-denied",
-            subject="Wire transfer approval",
-            sender_email="alerts@bank.example",
-        ),
-        # 2. Low confidence URGENT -> gemini-4-neon
-        make_email_thread(
-            thread_id="t-lowconf",
-            subject="Ambiguous contract term",
-            sender_email="legal@partner.example",
-        ),
-        # 3. Oversized FYI (> 100 chars) -> gemini-4-carbon
-        make_email_thread(
-            thread_id="t-oversized",
-            subject="Huge log dump",
-            sender_email="ops@acme.example",
-            body_text="X" * 200,
-        ),
-        # 4. Another flagged thread -> skipped because max_cloud_escalations_per_run=2
-        make_email_thread(
-            thread_id="t-overcap",
-            subject="Another complex thread",
-            sender_email="exec@partner.example",
-        ),
-    ]
-
-    cloud_calls: list[dict[str, Any]] = []
-
-    def fake_generate(**kwargs: Any) -> tuple[Any, ModelCallStats]:
-        stage = kwargs["stage"]
-        contents = str(kwargs["contents"])
-        if stage == "stage1_triage":
-            if "t-oversized" in contents:
-                return (
-                    Stage1Classification(
-                        category=TriageCategory.FYI,
-                        confidence=0.90,
-                        one_line_summary="Huge log",
-                        reason="FYI",
-                    ),
-                    _stats("inkling", kwargs["model"], stage),
+                    summary="Healthy urgent summary",
+                    deep_review_recommended=True,
                 )
-            return (
-                Stage1Classification(
-                    category=TriageCategory.URGENT,
-                    confidence=0.55,  # below 0.70 threshold
-                    one_line_summary="Needs review",
-                    needs_deep_analysis=True,
-                    reason="Uncertain",
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        if stage == "stage2_deep_analysis":
-            return (
-                DeepThreadAnalysis(
+            if call.stage == "stage3_executive_synthesis":
+                raise RuntimeError("Stage 3 synthesis down")
+            if call.stage == "stage3_high_stakes_review":
+                if "thr-s2-boom" in text:
+                    raise RuntimeError("Stage 3 review failed for s2-boom")
+                return HighStakesReview(
                     refined_category=TriageCategory.URGENT,
-                    confidence=0.55,
-                    summary="Ambiguous",
-                    escalation_recommended=True,
-                    escalation_reason="High stakes",
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        if stage == "stage3_executive_synthesis":
-            return (
-                ExecutiveBriefing(
-                    headline="Needs cloud check",
-                    executive_summary="Several uncertain threads.",
-                    cloud_escalation_thread_ids=["t-overcap"],
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        if kwargs["backend"] == "cloud":
-            cloud_calls.append(kwargs)
-            return (
-                CloudEscalationResult(
-                    refined_category=TriageCategory.URGENT,
-                    executive_summary="Authoritative cloud summary.",
-                    action_items=["Follow up"],
-                    risk_assessment="Moderate risk",
-                    suggested_next_step="Reply today",
-                ),
-                _stats("cloud", kwargs["model"], stage),
-            )
-        raise AssertionError(f"Unexpected call: {kwargs}")
+                    executive_summary="Healthy Neon review",
+                    risk_assessment="Manageable",
+                    suggested_next_step="Reply today.",
+                )
+            raise AssertionError(f"Unexpected stage {call.stage}")
 
-    router = MagicMock()
-    router.cloud_client = MagicMock()
-    router.generate_structured.side_effect = fake_generate
-    lease = _make_fake_lease(acquire_inkling_result=True)
+        router = FakeGenAIRouter(handler=_handler)
+        report = TriageOrchestrator(settings=test_settings, router=router).run(threads)  # type: ignore[arg-type]
 
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-    report = orchestrator.run(threads, allow_cloud=True)
+        by_id = {t.thread.thread_id: t for t in report.triaged_threads}
 
-    assert report.cloud_blocked_by_denylist == 1
-    assert report.cloud_escalations_count == 2
-    assert len(cloud_calls) == 2
+        # Stage 1 failure degraded cleanly to FYI with error_note
+        assert by_id["thr-s1-boom"].category == TriageCategory.FYI
+        assert by_id["thr-s1-boom"].confidence == 0.0
+        assert by_id["thr-s1-boom"].error_note is not None
+        assert "Transient Stage 1 failure" in by_id["thr-s1-boom"].error_note
 
-    # First escalated: t-lowconf -> gemini-4-neon; second: t-oversized -> gemini-4-carbon
-    by_tid = {t.thread.thread_id: t for t in report.triaged_threads}
-    assert by_tid["t-denied"].cloud_model_used is None
-    assert by_tid["t-lowconf"].cloud_model_used == "gemini-4-neon"
-    assert by_tid["t-oversized"].cloud_model_used == "gemini-4-carbon"
-    assert by_tid["t-overcap"].cloud_model_used is None  # capped at 2
+        # Stage 2 failure preserved Stage 1 summary/category without crashing
+        assert by_id["thr-s2-boom"].category == TriageCategory.URGENT
+        assert by_id["thr-s2-boom"].deep_analysis is None
+        assert by_id["thr-s2-boom"].high_stakes_review is None
 
+        # Healthy thread completed all 3 stages including HighStakesReview
+        assert by_id["thr-healthy"].deep_analysis is not None
+        assert by_id["thr-healthy"].high_stakes_review is not None
+        assert by_id["thr-healthy"].deep_review_model == "gemini-4-neon"
+        assert report.deep_reviews_count == 1
 
-def test_per_thread_fault_isolation_when_stage1_fails(test_settings: Settings) -> None:
-    threads = [
-        make_email_thread(thread_id="t-bad", subject="Broken thread", snippet="Broken snippet"),
-        make_email_thread(thread_id="t-good", subject="Good thread"),
-    ]
-
-    def fake_generate(**kwargs: Any) -> tuple[Any, ModelCallStats]:
-        stage = kwargs["stage"]
-        contents = str(kwargs["contents"])
-        if stage == "stage1_triage":
-            if "t-bad" in contents:
-                raise RuntimeError("Simulated JSON failure")
-            return (
-                Stage1Classification(
-                    category=TriageCategory.FYI,
-                    confidence=0.9,
-                    one_line_summary="All good",
-                    reason="Normal",
-                ),
-                _stats("inkling", kwargs["model"], stage),
-            )
-        return (
-            ExecutiveBriefing(headline="Partial ok", executive_summary="Good thread survived."),
-            _stats("inkling", kwargs["model"], stage),
-        )
-
-    router = MagicMock()
-    router.cloud_client = None
-    router.generate_structured.side_effect = fake_generate
-    lease = _make_fake_lease(acquire_inkling_result=True)
-
-    orchestrator = TriageOrchestrator(settings=test_settings, router=router, gpu_lease=lease)
-    report = orchestrator.run(threads, allow_cloud=False)
-
-    assert len(report.triaged_threads) == 2
-    by_tid = {t.thread.thread_id: t for t in report.triaged_threads}
-    assert by_tid["t-bad"].category == TriageCategory.FYI
-    assert by_tid["t-bad"].confidence == 0.0
-    assert by_tid["t-bad"].error_note is not None
-    assert "Simulated JSON failure" in by_tid["t-bad"].error_note
-    assert by_tid["t-good"].summary == "All good"
-    assert by_tid["t-good"].error_note is None
+        # Stage 3 synthesis failure produced graceful fallback briefing
+        assert report.briefing is not None
+        assert "3 substantive email(s)" in report.briefing.headline

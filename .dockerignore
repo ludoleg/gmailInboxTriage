@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+credentials.json
+token.json
+.venv
+__pycache__
+*.pyc
+*.db
+*.db-*
+.pytest_cache
+.ruff_cache
+tests
+deploy
+.github

@@ -1,20 +1,16 @@
-"""Read-only Gmail thread fetching, MIME walking, HTML cleanup, and attachment extraction."""
+"""Read-only Gmail thread fetching with native Gemini multimodal attachment pass-through."""
 
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import re
-import shutil
-import subprocess
 from datetime import UTC, datetime
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
 
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
-from pypdf import PdfReader
 
 from inbox_triage.config import Settings
 from inbox_triage.gmail.auth import get_gmail_credentials
@@ -26,8 +22,6 @@ MAX_ATTACHMENTS_PER_THREAD = 3
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 5 MB
 MAX_PDF_BYTES = 8 * 1024 * 1024  # 8 MB
-MAX_PDF_PAGES = 10
-MAX_PDF_CHARS = 24000
 MAX_BODY_CHARS_PER_MESSAGE = 16000
 
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
@@ -69,61 +63,6 @@ def extract_sender_parts(raw_from: str) -> tuple[str, str, str]:
     domain = addr_lower.split("@", 1)[1] if "@" in addr_lower else ""
     sender_label = display.strip() or addr_lower or raw_from.strip() or "Unknown"
     return sender_label, addr_lower, domain
-
-
-def extract_pdf_text(pdf_bytes: bytes, max_pages: int = MAX_PDF_PAGES) -> str:
-    """Extract text from the first `max_pages` of a PDF attachment locally via pypdf."""
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    chunks: list[str] = []
-    for page in reader.pages[:max_pages]:
-        page_text = (page.extract_text() or "").strip()
-        if page_text:
-            chunks.append(page_text)
-    full = "\n\n".join(chunks)
-    if len(full) > MAX_PDF_CHARS:
-        full = full[:MAX_PDF_CHARS] + "\n...[PDF truncated]"
-    return full
-
-
-def normalize_audio_to_wav16k(audio_bytes: bytes, mime_type: str) -> tuple[bytes | None, str | None]:
-    """Convert audio bytes into 16 kHz mono RIFF WAV for Gemma 4 Ollama audio input.
-
-    Returns (wav_bytes, note). If ffmpeg is unavailable and input is not already WAV,
-    returns (None, explanation_note).
-    """
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is not None:
-        try:
-            proc = subprocess.run(
-                [
-                    ffmpeg_bin,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    "pipe:0",
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-                    "-f",
-                    "wav",
-                    "pipe:1",
-                ],
-                input=audio_bytes,
-                capture_output=True,
-                timeout=20.0,
-                check=True,
-            )
-            return proc.stdout, None
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("ffmpeg audio conversion failed: %s", exc)
-            return None, f"Audio conversion failed ({mime_type})"
-
-    if mime_type in ("audio/wav", "audio/x-wav") and audio_bytes[:4] == b"RIFF":
-        return audio_bytes, "Passed through WAV without ffmpeg resampling"
-
-    return None, f"Skipped non-WAV audio ({mime_type}): ffmpeg not installed"
 
 
 def _header_map(headers: list[dict[str, str]]) -> dict[str, str]:
@@ -174,11 +113,26 @@ def _walk_parts(
         _walk_parts(child, plain_chunks, html_chunks, attachment_refs)
 
 
+def _canonical_mime(mime: str, kind: AttachmentKind) -> str:
+    if kind == AttachmentKind.PDF:
+        return "application/pdf"
+    if mime == "image/jpg":
+        return "image/jpeg"
+    if mime == "audio/x-wav":
+        return "audio/wav"
+    if mime == "audio/mp3":
+        return "audio/mpeg"
+    return mime
+
+
 def parse_gmail_thread(
     raw_thread: dict[str, Any],
     attachment_fetcher: Any | None = None,
 ) -> EmailThread:
-    """Convert a raw Gmail API thread resource into a normalized EmailThread."""
+    """Convert a raw Gmail API thread resource into a normalized EmailThread.
+
+    Image, audio, and PDF attachments are kept as raw bytes for native Gemini multimodal input.
+    """
     thread_id = raw_thread["id"]
     messages = raw_thread.get("messages") or []
     if not messages:
@@ -263,7 +217,7 @@ def parse_gmail_thread(
                 attachments.append(
                     EmailAttachment(
                         filename=fname,
-                        mime_type=mime,
+                        mime_type=_canonical_mime(mime, kind),
                         kind=kind,
                         size_bytes=size,
                         note=f"Attachment exceeds {cap // (1024 * 1024)} MB cap",
@@ -281,7 +235,7 @@ def parse_gmail_thread(
                 attachments.append(
                     EmailAttachment(
                         filename=fname,
-                        mime_type=mime,
+                        mime_type=_canonical_mime(mime, kind),
                         kind=kind,
                         size_bytes=size,
                         note="Attachment payload unavailable",
@@ -289,51 +243,15 @@ def parse_gmail_thread(
                 )
                 continue
 
-            if kind == AttachmentKind.PDF:
-                try:
-                    pdf_text = extract_pdf_text(raw_bytes)
-                    attachments.append(
-                        EmailAttachment(
-                            filename=fname,
-                            mime_type=mime,
-                            kind=kind,
-                            size_bytes=len(raw_bytes),
-                            extracted_text=pdf_text or None,
-                            note=None if pdf_text else "Scanned PDF with no extractable text",
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    attachments.append(
-                        EmailAttachment(
-                            filename=fname,
-                            mime_type=mime,
-                            kind=kind,
-                            size_bytes=len(raw_bytes),
-                            note=f"PDF parse error: {exc}",
-                        )
-                    )
-            elif kind == AttachmentKind.AUDIO:
-                wav_bytes, note = normalize_audio_to_wav16k(raw_bytes, mime)
-                attachments.append(
-                    EmailAttachment(
-                        filename=fname,
-                        mime_type="audio/wav" if wav_bytes else mime,
-                        kind=kind,
-                        size_bytes=len(wav_bytes) if wav_bytes else len(raw_bytes),
-                        data_bytes=wav_bytes,
-                        note=note,
-                    )
+            attachments.append(
+                EmailAttachment(
+                    filename=fname,
+                    mime_type=_canonical_mime(mime, kind),
+                    kind=kind,
+                    size_bytes=len(raw_bytes),
+                    data_bytes=raw_bytes,
                 )
-            else:
-                attachments.append(
-                    EmailAttachment(
-                        filename=fname,
-                        mime_type=mime,
-                        kind=kind,
-                        size_bytes=len(raw_bytes),
-                        data_bytes=raw_bytes,
-                    )
-                )
+            )
 
     return EmailThread(
         thread_id=thread_id,
@@ -363,7 +281,10 @@ class GmailClient:
     @property
     def service(self) -> Any:
         if self._service is None:
-            creds = get_gmail_credentials(self.settings.gmail_token_path)
+            creds = get_gmail_credentials(
+                self.settings.gmail_token_path,
+                token_json=self.settings.gmail_token_json,
+            )
             self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
         return self._service
 

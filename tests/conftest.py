@@ -1,4 +1,4 @@
-"""Shared fixtures and synthetic data builders for inbox_triage tests."""
+"""Shared fixtures and synthetic data builders for inbox_triage GCP serverless tests."""
 
 from __future__ import annotations
 
@@ -22,10 +22,9 @@ def make_valid_png_bytes(width: int = 32, height: int = 32) -> bytes:
         crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
         return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
 
-    # White background with a dark horizontal stripe (looks like a simple receipt header)
     raw_rows = bytearray()
     for y in range(height):
-        raw_rows.append(0)  # filter type 0 (None)
+        raw_rows.append(0)
         for x in range(width):
             if 4 <= y <= 10 and 4 <= x <= width - 5:
                 raw_rows.extend((30, 30, 30))
@@ -55,7 +54,7 @@ def make_valid_wav_bytes(duration_s: float = 0.1, sample_rate: int = 16000) -> b
 
 
 def make_valid_pdf_bytes(text: str = "Invoice #42 Total: $1,250.00 due Friday") -> bytes:
-    """Build a minimal valid single-page PDF with extractable Helvetica text."""
+    """Build a minimal valid single-page PDF with Helvetica text."""
     escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
     stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET\n".encode("latin-1")
 
@@ -114,8 +113,10 @@ def make_email_thread(
     labels: list[str] | None = None,
     attachments: list[EmailAttachment] | None = None,
 ) -> EmailThread:
-    domain = sender_domain if sender_domain is not None else (
-        sender_email.split("@", 1)[1] if "@" in sender_email else ""
+    domain = (
+        sender_domain
+        if sender_domain is not None
+        else (sender_email.split("@", 1)[1] if "@" in sender_email else "")
     )
     return EmailThread(
         thread_id=thread_id,
@@ -137,18 +138,28 @@ def make_email_thread(
 
 @pytest.fixture
 def test_settings(tmp_path: Path) -> Settings:
-    """Isolated Settings instance backed by tmp_path (ignores host .env)."""
+    """Isolated Settings instance backed by tmp_path SQLite (ignores host .env)."""
     return Settings(
         _env_file=None,
+        TIMEZONE="America/Los_Angeles",
+        GCP_PROJECT_ID="test-gcp-project",
+        USE_VERTEXAI=False,
+        VERTEX_LOCATION="global",
+        GEMINI_API_KEY="test-gemini-key",
+        MODEL_STAGE1_FAST="gemini-3.5-flash-lite",
+        MODEL_STAGE2_WORKHORSE="gemini-4-carbon",
+        MODEL_STAGE3_REASONING="gemini-4-neon",
+        MAX_CONCURRENCY=4,
+        DEEP_REVIEW_CONFIDENCE_THRESHOLD=0.70,
+        MAX_DEEP_REVIEWS_PER_RUN=5,
+        STATE_BACKEND="sqlite",
+        FIRESTORE_DATABASE="(default)",
         STATE_DB_PATH=tmp_path / "state.db",
+        GMAIL_TOKEN_JSON=None,
         GMAIL_CREDENTIALS_PATH=tmp_path / "credentials.json",
         GMAIL_TOKEN_PATH=tmp_path / "token.json",
-        INKLING_CTL_PATH=tmp_path / "inkling-ctl",
-        GEMINI_API_KEY="test-gemini-key",
         SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX",
-        CLOUD_DENYLIST_DOMAINS="bank.example, confidential.org",
-        MAX_CLOUD_ESCALATIONS_PER_RUN=5,
-        INKLING_OVERFLOW_CHARS=84000,
+        SLACK_MENTION_ON_URGENT=None,
     )
 
 
@@ -168,8 +179,12 @@ def tiny_pdf_bytes() -> bytes:
 
 
 @pytest.fixture
-def synthetic_inbox_threads(tiny_png_bytes: bytes) -> list[EmailThread]:
-    """Four realistic synthetic emails covering urgent+image, CI alert, promo, and action."""
+def synthetic_inbox_threads(
+    tiny_png_bytes: bytes,
+    tiny_wav_bytes: bytes,
+    tiny_pdf_bytes: bytes,
+) -> list[EmailThread]:
+    """Realistic synthetic emails covering urgent+multimodal, CI alert, promo, newsletter, and action."""
     base_time = datetime(2026, 4, 15, 11, 30, tzinfo=UTC)
     return [
         make_email_thread(
@@ -183,7 +198,7 @@ def synthetic_inbox_threads(tiny_png_bytes: bytes) -> list[EmailThread]:
             body_text=(
                 "Hi,\n\n"
                 "Your production hosting invoice #INV-9921 for $480.00 is past due. "
-                "Please review the attached receipt image and update your payment method "
+                "Please review the attached receipt image, voicemail, and PDF statement "
                 "before 5:00 PM Pacific today to avoid cluster suspension.\n\n"
                 "Thanks,\nCloudHost Billing"
             ),
@@ -194,7 +209,21 @@ def synthetic_inbox_threads(tiny_png_bytes: bytes) -> list[EmailThread]:
                     kind=AttachmentKind.IMAGE,
                     size_bytes=len(tiny_png_bytes),
                     data_bytes=tiny_png_bytes,
-                )
+                ),
+                EmailAttachment(
+                    filename="voicemail.wav",
+                    mime_type="audio/wav",
+                    kind=AttachmentKind.AUDIO,
+                    size_bytes=len(tiny_wav_bytes),
+                    data_bytes=tiny_wav_bytes,
+                ),
+                EmailAttachment(
+                    filename="statement.pdf",
+                    mime_type="application/pdf",
+                    kind=AttachmentKind.PDF,
+                    size_bytes=len(tiny_pdf_bytes),
+                    data_bytes=tiny_pdf_bytes,
+                ),
             ],
         ),
         make_email_thread(
@@ -230,8 +259,19 @@ def synthetic_inbox_threads(tiny_png_bytes: bytes) -> list[EmailThread]:
             ),
         ),
         make_email_thread(
-            thread_id="thr-action-meeting",
+            thread_id="thr-newsletter",
             last_message_id="msg-104",
+            subject="Weekly Cloud Digest #88",
+            sender="Cloud Weekly",
+            sender_email="digest@cloudweekly.example",
+            received_at=base_time,
+            has_list_unsubscribe=True,
+            snippet="Top serverless articles this week.",
+            body_text="Here are the top 5 serverless articles this week.",
+        ),
+        make_email_thread(
+            thread_id="thr-action-meeting",
+            last_message_id="msg-105",
             subject="Confirm Q2 roadmap review slot tomorrow?",
             sender="Maya Lin",
             sender_email="maya.lin@partner.example",

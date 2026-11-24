@@ -1,7 +1,7 @@
 [project]
 name = "gmail-inbox-triage"
-version = "0.1.0"
-description = "Scheduled 5:30 AM PT Gmail inbox triage service using google-genai with Inkling-2-Mini, Ollama multimodal models, and selective Cloud Gemini 4 escalation."
+version = "0.2.0"
+description = "Serverless GCP 5:30 AM PT Gmail inbox triage service using google-genai (Flash-Lite -> Gemini 4 Carbon -> Gemini 4 Neon), Cloud Run Jobs, Firestore, and Slack."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,11 +9,11 @@ dependencies = [
     "google-api-python-client>=2.150.0",
     "google-auth-httplib2>=0.2.0",
     "google-auth-oauthlib>=1.2.1",
+    "google-cloud-firestore>=2.19.0",
     "google-genai>=1.10.0",
     "httpx>=0.28.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
-    "pypdf>=5.1.0",
     "rich>=13.9.0",
     "typer>=0.15.0",
 ]
@@ -38,9 +38,6 @@ packages = ["src/inbox_triage"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "integration: live local model integration tests (requires Ollama and/or inkling_engine)",
-]
 
 [tool.ruff]
 line-length = 100

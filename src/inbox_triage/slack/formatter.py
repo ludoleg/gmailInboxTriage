@@ -38,24 +38,24 @@ def _format_priority_card(item: TriagedThread, tz: ZoneInfo, badge: str) -> str:
     ts = item.thread.received_at.astimezone(tz).strftime("%-I:%M %p %Z")
     subj = _escape_slack(item.thread.subject)
     sender = _escape_slack(item.thread.sender)
-    cloud_tag = f"  `☁️ {item.cloud_model_used}`" if item.cloud_model_used else ""
+    review_tag = f"  `✨ {item.deep_review_model}`" if item.deep_review_model else ""
 
     lines = [
-        f"{badge} *<{item.thread.gmail_url}|{subj}>*{cloud_tag}",
+        f"{badge} *<{item.thread.gmail_url}|{subj}>*{review_tag}",
         f"From: *{sender}* · {ts}",
         _escape_slack(item.summary),
     ]
 
-    if item.cloud_escalation:
-        ce = item.cloud_escalation
-        if ce.deadline:
-            lines.append(f"• *Deadline:* {_escape_slack(ce.deadline)}")
-        if ce.action_items:
-            lines.append("• *Actions:* " + "; ".join(_escape_slack(a) for a in ce.action_items[:3]))
-        if ce.risk_assessment:
-            lines.append(f"• *Risk:* {_escape_slack(ce.risk_assessment)}")
-        if ce.suggested_next_step:
-            lines.append(f"• *Next step:* {_escape_slack(ce.suggested_next_step)}")
+    if item.high_stakes_review:
+        hr = item.high_stakes_review
+        if hr.deadline:
+            lines.append(f"• *Deadline:* {_escape_slack(hr.deadline)}")
+        if hr.action_items:
+            lines.append("• *Actions:* " + "; ".join(_escape_slack(a) for a in hr.action_items[:3]))
+        if hr.risk_assessment:
+            lines.append(f"• *Risk:* {_escape_slack(hr.risk_assessment)}")
+        if hr.suggested_next_step:
+            lines.append(f"• *Next step:* {_escape_slack(hr.suggested_next_step)}")
     elif item.deep_analysis:
         da = item.deep_analysis
         if da.deadline:
@@ -64,10 +64,8 @@ def _format_priority_card(item: TriagedThread, tz: ZoneInfo, badge: str) -> str:
             lines.append("• *Actions:* " + "; ".join(_escape_slack(a) for a in da.action_items[:3]))
         if da.suggested_reply_points:
             lines.append("• *Reply points:* " + "; ".join(_escape_slack(r) for r in da.suggested_reply_points[:2]))
-
-    if item.multimodal_findings:
-        mm_notes = "; ".join(f"{f.filename}: {f.summary}" for f in item.multimodal_findings[:2])
-        lines.append(f"• *Attachment(s):* {_escape_slack(mm_notes)}")
+        if da.attachment_findings:
+            lines.append("• *Attachment(s):* " + "; ".join(_escape_slack(f) for f in da.attachment_findings[:2]))
 
     return "\n".join(lines)
 
@@ -94,7 +92,7 @@ def build_slack_payloads(
 
     if report.total_threads_fetched == 0:
         blocks.append(_section("✨ *Inbox Zero!* No new unread emails since the last triage run."))
-        blocks.append(_context("0 GPU switches · 0 model calls"))
+        blocks.append(_context("0 model calls · GCP Cloud Run"))
         return [{"text": f"Morning Inbox Triage ({date_label}): Inbox Zero", "blocks": blocks}]
 
     counts_line = (
@@ -153,16 +151,15 @@ def build_slack_payloads(
             )
         )
 
-    # Telemetry footer
     models_used = sorted({s.model for s in report.call_stats})
     elapsed_s = (report.completed_at - report.started_at).total_seconds()
+    total_tokens = report.total_prompt_tokens + report.total_completion_tokens
     footer_parts = [
         f"Models: {', '.join(models_used) if models_used else 'none'}",
-        f"Cloud escalations: {report.cloud_escalations_count}",
+        f"Tokens: {total_tokens:,}",
+        f"Deep reviews: {report.deep_reviews_count}",
         f"Runtime: {elapsed_s:.1f}s",
     ]
-    if report.cloud_blocked_by_denylist:
-        footer_parts.append(f"Privacy-blocked: {report.cloud_blocked_by_denylist}")
     blocks.append(_context(" · ".join(footer_parts)))
 
     fallback_text = (
@@ -170,7 +167,6 @@ def build_slack_payloads(
         f"{len(urgent)} Urgent, {len(action)} Action, {len(tech)} Tech Alerts"
     )
 
-    # Split into <= 50-block payloads
     payloads: list[dict[str, Any]] = []
     for i in range(0, len(blocks), MAX_BLOCKS_PER_MESSAGE):
         chunk = blocks[i : i + MAX_BLOCKS_PER_MESSAGE]

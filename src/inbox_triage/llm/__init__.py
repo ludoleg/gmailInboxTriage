@@ -1,7 +1,5 @@
-"""LLM transport, GPU lease management, and multi-model routing."""
+"""Google GenAI router for Gemini Developer API and Vertex AI."""
 
-from inbox_triage.llm.gpu_lease import GpuLeaseManager
-from inbox_triage.llm.local_transport import LocalGenAITransport
-from inbox_triage.llm.router import ModelRouter
+from inbox_triage.llm.router import GenAIRouter
 
-__all__ = ["GpuLeaseManager", "LocalGenAITransport", "ModelRouter"]
+__all__ = ["GenAIRouter"]

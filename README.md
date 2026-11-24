@@ -1,53 +1,50 @@
-# Gmail Inbox Triage Service
+# Gmail Inbox Triage Service (GCP Serverless)
 
-A read-only, scheduled morning Gmail inbox triage service that runs daily at **5:30 AM Pacific Time (`America/Los_Angeles`)** and posts an actionable **Slack Block Kit** digest via an Incoming Webhook.
+A read-only, serverless Gmail inbox triage service running on **Google Cloud Platform** (**Cloud Run Jobs** + **Cloud Scheduler** at **5:30 AM Pacific Time / `America/Los_Angeles`**) and posting an actionable **Slack Block Kit** digest via an Incoming Webhook.
 
-All LLM calls go through the official **`google-genai` Python SDK** (`from google import genai`) across three backends:
-1. **Conditional Phase A — Ollama (`gemma4:12b`)**: Runs *only* when unread emails contain image or audio attachments (extracting visual descriptions & 16 kHz WAV audio transcripts). Skipped completely on text-only mornings (**zero GPU switches**).
-2. **Primary Phase B — Inkling-2-Mini (`inkling_engine` on `127.0.0.1:8001`)**: Managed via `/home/ludo/.local/bin/inkling-ctl` for exclusive GTX 1080 Ti VRAM ownership. Runs Stages 1–3 in one hot pass using dynamic `reasoning_effort` (`none` → `low` → `medium`) with KV prefix reuse. Automatically falls back to Ollama (`gemma4:e2b` → `qwen2.5-coder:3b` → `bonsai-2:27b`) if Inkling is unavailable, and always restores `inkling-server.service` to its exact pre-run state without touching `~/.hermes/config.yaml`.
-3. **Selective Phase C — Cloud Gemini 4 (`gemini-4-carbon` & `gemini-4-neon`)**: Invoked only for oversized threads (>28K tokens → `gemini-4-carbon`) or high-stakes/low-confidence escalations (`gemini-4-neon`), gated by `CLOUD_DENYLIST_DOMAINS` and `MAX_CLOUD_ESCALATIONS_PER_RUN`.
+*(Looking for the local GPU `barcalinux` edition with Inkling-2-Mini + Ollama? Check out the `barcalinux` branch or tag `v0.1.0-local`.)*
 
-## Setup
+## Architecture (3-Tier Strength-Matched Gemini Funnel)
 
-### 1. Install Dependencies
+All model calls use the official **`google-genai` Python SDK** (defaulting to `GEMINI_API_KEY` via Secret Manager, with `USE_VERTEXAI=true` supported as a 1-line toggle for keyless Vertex AI IAM):
+
+1. **Stage 0 (Gmail API + Firestore)**: Fetches unread inbox threads since the last Firestore watermark, deduplicates by `(thread_id, last_message_id)`, cleans HTML, and keeps raw image/audio/PDF bytes for native Gemini multimodal input.
+2. **Stage 1 (`gemini-3.5-flash-lite`, concurrent)**: Ultra-fast bulk classification (`URGENT`, `ACTION_REQUIRED`, `TECHNICAL_ALERT`, `FYI`, `NEWSLETTER`, `PROMO_NOISE`); drops noise early.
+3. **Stage 2 (`gemini-4-carbon`, concurrent, native multimodal)**: Extracts structured CI/PR/monitoring alerts and performs deep action-item, deadline, reply-point, and native attachment analysis (images, audio, and PDFs via `types.Part.from_bytes`).
+4. **Stage 3 (`gemini-4-neon`, `max_output_tokens=8192`)**: Synthesizes the cross-thread morning `ExecutiveBriefing` and runs authoritative `HighStakesReview` on any flagged or low-confidence threads.
+
+## Quickstart (Local Dev & Testing)
+
 ```bash
-cd /home/ludo/gmailInboxTriage
 uv sync
-```
-
-### 2. Configure `.env`
-```bash
 cp .env.example .env
-```
-Fill in:
-- `SLACK_WEBHOOK_URL`: Create an Incoming Webhook in your Slack workspace (`https://api.slack.com/apps` → Incoming Webhooks).
-- `GEMINI_API_KEY`: Your Google AI Studio API key (for optional Phase C escalations to `gemini-4-carbon` / `gemini-4-neon`).
-- `CLOUD_DENYLIST_DOMAINS`: Optional comma-separated domains (e.g., `bank.com,legal.org`) that must never leave localhost.
-
-### 3. Authorize Read-Only Gmail Access (`gmail.readonly`)
-1. In Google Cloud Console, enable the **Gmail API** and create an **OAuth 2.0 Client ID (Desktop app)**.
-2. Download the JSON file to `/home/ludo/gmailInboxTriage/credentials.json`.
-3. Run the one-time authorization flow:
-```bash
+# Fill in GEMINI_API_KEY, SLACK_WEBHOOK_URL, and run one-time OAuth:
 uv run triage auth
+
+# Verify health & dry-run using local SQLite state:
+uv run triage check-health --local-state
+uv run triage run --dry-run --local-state --since-hours 24
 ```
 
-### 4. Verify Health & Dry-Run
-```bash
-uv run triage check-health
-uv run triage run --dry-run --since-hours 24
-```
+## Deploy to GCP (`gmail-inbox-triage-515705`)
 
-### 5. Enable the 5:30 AM Pacific `systemd --user` Timer
-```bash
-uv run triage install-timer
-systemctl --user list-timers gmail-triage.timer
-```
-To ensure the 5:30 AM timer runs even when you are not actively logged into a desktop session:
-```bash
-loginctl enable-linger "$USER"
-```
-View logs from scheduled runs:
-```bash
-journalctl --user -u gmail-triage.service -n 100
-```
+1. Ensure `gcloud` is authenticated (`gcloud auth login`) and billing is linked to `gmail-inbox-triage-515705`.
+2. Export your secrets (or ensure they exist in Secret Manager) and run the idempotent deploy script:
+   ```bash
+   chmod +x deploy/gcp/deploy.sh
+   source .env
+   ./deploy/gcp/deploy.sh
+   ```
+   *(To use keyless Vertex AI IAM instead of `GEMINI_API_KEY`, run `USE_VERTEXAI=true ./deploy/gcp/deploy.sh`.)*
+3. Trigger an immediate test execution in Cloud Run:
+   ```bash
+   gcloud run jobs execute gmail-inbox-triage --region us-west1 --wait
+   ```
+4. Once confirmed, disable the old local `barcalinux` timer so you don't receive duplicate digests:
+   ```bash
+   systemctl --user disable --now gmail-triage.timer
+   ```
+
+## GitHub Actions Auto-Deploy
+
+`.github/workflows/deploy.yml` runs `ruff` and `pytest` on every push/PR. To enable Heroku-style auto-deploy on push to `main`, set repository variable `ENABLE_GCP_DEPLOY=true` and secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`.
