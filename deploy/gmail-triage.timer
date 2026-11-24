@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Gmail Inbox Triage daily at 5:30 AM Pacific Time
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 America/Los_Angeles
+Persistent=true
+AccuracySec=1m
+Unit=gmail-triage.service
+
+[Install]
+WantedBy=timers.target

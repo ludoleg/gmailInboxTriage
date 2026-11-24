@@ -1,0 +1,20 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+
+# Runtime state & caches
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/

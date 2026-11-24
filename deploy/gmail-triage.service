@@ -1,0 +1,14 @@
+[Unit]
+Description=Gmail Inbox Triage (Inkling-2-Mini + Ollama + Cloud Gemini 4 -> Slack)
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ludo/gmailInboxTriage
+EnvironmentFile=-/home/ludo/gmailInboxTriage/.env
+Environment=PATH=/home/ludo/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ludo/.local/bin/uv run triage run
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900
