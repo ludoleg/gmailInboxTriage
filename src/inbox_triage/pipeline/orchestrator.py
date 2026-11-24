@@ -220,7 +220,7 @@ class TriageOrchestrator:
                 contents=prompt,
                 response_schema=TechExtraction,
                 temperature=0.0,
-                max_output_tokens=2048,
+                max_output_tokens=4096,
             )
             record_stat(stats)
             item.tech_extraction = tech

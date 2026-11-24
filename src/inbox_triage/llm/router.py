@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any, Literal, TypeVar
 
+import httpx
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, ValidationError
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_HTTP_TIMEOUT_MS = 60_000  # 60 seconds per GenAI request
 
 
 class GenAIRouter:
@@ -32,11 +34,13 @@ class GenAIRouter:
         self,
         settings: Settings,
         client: genai.Client | None = None,
+        timeout_ms: int = DEFAULT_HTTP_TIMEOUT_MS,
     ) -> None:
         self.settings = settings
         self.backend_name: Literal["vertexai", "gemini_api"] = (
             "vertexai" if settings.use_vertexai else "gemini_api"
         )
+        http_opts = types.HttpOptions(timeout=timeout_ms)
         if client is not None:
             self.client = client
         elif settings.use_vertexai:
@@ -44,6 +48,7 @@ class GenAIRouter:
                 vertexai=True,
                 project=settings.gcp_project_id,
                 location=settings.vertex_location,
+                http_options=http_opts,
             )
         else:
             if not settings.gemini_api_key:
@@ -51,7 +56,7 @@ class GenAIRouter:
                     "GEMINI_API_KEY is required when USE_VERTEXAI=false. "
                     "Set GEMINI_API_KEY or enable USE_VERTEXAI=true."
                 )
-            self.client = genai.Client(api_key=settings.gemini_api_key)
+            self.client = genai.Client(api_key=settings.gemini_api_key, http_options=http_opts)
 
     def generate_structured(
         self,
@@ -125,6 +130,23 @@ class GenAIRouter:
                         stage,
                         attempt,
                         max_retries,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                raise
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_err = exc
+                if attempt < max_retries:
+                    logger.warning(
+                        "[%s/%s] Network/timeout error on %s (attempt %d/%d): %s; retrying in %.1fs",
+                        self.backend_name,
+                        model,
+                        stage,
+                        attempt,
+                        max_retries,
+                        exc,
                         backoff,
                     )
                     time.sleep(backoff)

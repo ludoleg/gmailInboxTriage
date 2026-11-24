@@ -5,12 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from google.genai import errors
+from google.genai import errors, types
 from pydantic import BaseModel, ValidationError
 
 from inbox_triage.config import Settings
-from inbox_triage.llm.router import GenAIRouter
+from inbox_triage.llm.router import DEFAULT_HTTP_TIMEOUT_MS, GenAIRouter
 from inbox_triage.models import Stage1Classification, TriageCategory
 
 
@@ -54,7 +55,9 @@ class TestGenAIRouterInit:
             vertexai=True,
             project="gmail-inbox-triage-515705",
             location="global",
+            http_options=types.HttpOptions(timeout=DEFAULT_HTTP_TIMEOUT_MS),
         )
+        assert DEFAULT_HTTP_TIMEOUT_MS == 60_000
         assert router.backend_name == "vertexai"
         assert router.client is fake_client
 
@@ -66,7 +69,10 @@ class TestGenAIRouterInit:
         with patch("inbox_triage.llm.router.genai.Client", return_value=fake_client) as mock_cls:
             router = GenAIRouter(api_settings)
 
-        mock_cls.assert_called_once_with(api_key="AIza-test-secret")
+        mock_cls.assert_called_once_with(
+            api_key="AIza-test-secret",
+            http_options=types.HttpOptions(timeout=60_000),
+        )
         assert router.backend_name == "gemini_api"
         assert router.client is fake_client
 
@@ -295,3 +301,49 @@ class TestGenAIRouterStructuredGeneration:
         assert exc_info.value.code == 400
         assert client.models.generate_content.call_count == 1
         mock_sleep.assert_not_called()
+
+    def test_generate_structured_retries_on_httpx_timeout_and_transport_error(
+        self, test_settings: Settings
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = [
+            httpx.ReadTimeout("socket read timed out"),
+            httpx.ConnectError("connection reset"),
+            _fake_response(parsed=_SimpleSchema(label="recovered-net", score=0.97)),
+        ]
+        router = GenAIRouter(test_settings, client=client)
+
+        with patch("inbox_triage.llm.router.time.sleep") as mock_sleep:
+            result, _ = router.generate_structured(
+                model="gemini-4-carbon",
+                stage="stage2_deep_multimodal",
+                system_prompt="Analyze.",
+                contents="content",
+                response_schema=_SimpleSchema,
+                max_retries=3,
+            )
+
+        assert result == _SimpleSchema(label="recovered-net", score=0.97)
+        assert client.models.generate_content.call_count == 3
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [1.0, 2.0]
+
+    def test_generate_structured_reraises_timeout_after_exhaustion(
+        self, test_settings: Settings
+    ) -> None:
+        client = MagicMock()
+        client.models.generate_content.side_effect = httpx.ReadTimeout("timed out")
+        router = GenAIRouter(test_settings, client=client)
+
+        with patch("inbox_triage.llm.router.time.sleep") as mock_sleep:
+            with pytest.raises(httpx.ReadTimeout):
+                router.generate_structured(
+                    model="gemini-4-neon",
+                    stage="stage3_executive_synthesis",
+                    system_prompt="Brief.",
+                    contents="cards",
+                    response_schema=_SimpleSchema,
+                    max_retries=2,
+                )
+
+        assert client.models.generate_content.call_count == 2
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [1.0]
