@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # Gmail Read-Only OAuth
     gmail_token_json: str | None = Field(default=None, alias="GMAIL_TOKEN_JSON")
     gmail_credentials_path: Path = Field(
-        default=Path("/home/ludo/gmailInboxTriage/credentials.json"),
+        default=Path("/home/ludo/projects/gmailInboxTriage/credentials.json"),
         alias="GMAIL_CREDENTIALS_PATH",
     )
     gmail_token_path: Path = Field(
