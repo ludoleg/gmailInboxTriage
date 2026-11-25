@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 # =============================================================================
 # Idempotent GCP Serverless Deployment for Gmail Inbox Triage
@@ -38,7 +39,7 @@ gcloud services enable "${APIS[@]}"
 
 echo "==> 2. Ensuring Firestore Native database exists..."
 if ! gcloud firestore databases describe --database="(default)" >/dev/null 2>&1; then
-  gcloud firestore databases create --location="${REGION}" --type=firestore-native
+  gcloud firestore databases create --location="${REGION}" --type=firestore-native --quiet
 fi
 
 echo "==> 3. Ensuring Artifact Registry repo exists..."
@@ -53,6 +54,8 @@ echo "==> 4. Ensuring least-privilege Service Account exists..."
 if ! gcloud iam service-accounts describe "${SA_EMAIL}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${SA_NAME}" \
     --display-name="Gmail Inbox Triage Cloud Run SA"
+  echo "    Waiting for Service Account IAM propagation..."
+  sleep 10
 fi
 
 ROLES=(
