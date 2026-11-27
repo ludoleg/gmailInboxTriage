@@ -1,4 +1,4 @@
-"""Domain & structured-output Pydantic models for the GCP 3-tier triage pipeline."""
+"""Domain & structured-output Pydantic models for the GCP 3-tier triage & interactive actions."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ class EmailThread(BaseModel):
     sender_domain: str
     received_at: datetime
     message_count: int = 1
+    rfc_message_id: str | None = None
     snippet: str = ""
     body_text: str = ""
     has_list_unsubscribe: bool = False
@@ -152,6 +153,47 @@ class HighStakesReview(BaseModel):
     suggested_next_step: str = Field(description="Single clearest next step for the user.")
 
 
+# --- Phase 2 Interactive Action Schemas ---
+
+
+class ReplyDraftResult(BaseModel):
+    subject: str = Field(description="Email subject line (typically starting with 'Re: ').")
+    body_text: str = Field(description="Plain-text reply body ready to save as a Gmail Draft.")
+    tone_note: str = Field(description="Short note describing the reply tone and intent.")
+    open_questions: list[str] = Field(
+        default_factory=list,
+        description="Any details the user should double-check before clicking Send in Gmail.",
+    )
+
+
+class TaskOrEventSpec(BaseModel):
+    kind: Literal["calendar_event", "google_task"] = Field(
+        description="Use 'calendar_event' when the email describes a scheduled event with a time window (meeting, flight, hotel, appointment); otherwise 'google_task'."
+    )
+    title: str = Field(description="Concise event or task title.")
+    notes: str = Field(default="", description="Relevant context, confirmation numbers, or action details.")
+    start_iso: str | None = Field(
+        default=None,
+        description="ISO-8601 start datetime with timezone offset for calendar_event (e.g. 2026-12-13T15:00:00-08:00).",
+    )
+    end_iso: str | None = Field(
+        default=None,
+        description="ISO-8601 end datetime with timezone offset for calendar_event.",
+    )
+    due_date: str | None = Field(
+        default=None,
+        description="Optional YYYY-MM-DD due date for google_task.",
+    )
+    location: str | None = Field(default=None, description="Physical location or meeting link if present.")
+    timezone: str = Field(default="America/Los_Angeles", description="IANA timezone for calendar events.")
+
+
+class MutedSender(BaseModel):
+    sender_email: str
+    muted_at: datetime
+    reason: str | None = None
+
+
 # --- Aggregated Pipeline Artifacts ---
 
 
@@ -183,6 +225,7 @@ class TriageRunReport(BaseModel):
     completed_at: datetime
     timezone: str
     total_threads_fetched: int
+    muted_skipped_count: int = 0
     triaged_threads: list[TriagedThread] = Field(default_factory=list)
     briefing: ExecutiveBriefing | None = None
     call_stats: list[ModelCallStats] = Field(default_factory=list)

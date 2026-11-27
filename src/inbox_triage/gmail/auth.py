@@ -1,4 +1,4 @@
-"""Gmail OAuth2 authentication supporting Secret Manager JSON env and local token file."""
+"""Google Workspace OAuth2 authentication supporting Secret Manager JSON env and local token file."""
 
 from __future__ import annotations
 
@@ -11,7 +11,16 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-SCOPES = [GMAIL_READONLY_SCOPE]
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+TASKS_SCOPE = "https://www.googleapis.com/auth/tasks"
+
+# Minimal Phase 2 scopes: read/archive/draft Gmail (cannot permanently delete), create Calendar events & Tasks.
+SCOPES = [
+    GMAIL_MODIFY_SCOPE,
+    CALENDAR_EVENTS_SCOPE,
+    TASKS_SCOPE,
+]
 
 
 def _write_token_secure(token_path: Path, token_json: str) -> None:
@@ -52,18 +61,20 @@ def get_gmail_credentials(
     """Load OAuth2 credentials from Secret Manager env (GMAIL_TOKEN_JSON) or local token.json.
 
     When loaded from `token_json`, expired access tokens refresh in memory without writing to disk.
+    Does not force a strict scope subset during load so existing read-only tokens continue working
+    for read-only runs until the user re-runs `triage auth` for Phase 2 write scopes.
     """
     from_env = bool(token_json and token_json.strip())
     if from_env:
         info = json.loads(token_json.strip())  # type: ignore[union-attr]
-        creds = Credentials.from_authorized_user_info(info, SCOPES)
+        creds = Credentials.from_authorized_user_info(info)
     else:
         if not token_path.exists():
             raise FileNotFoundError(
                 f"Gmail OAuth token not found at {token_path} and GMAIL_TOKEN_JSON is unset. "
                 "Run `uv run triage auth` first or inject GMAIL_TOKEN_JSON from Secret Manager."
             )
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(token_path))
 
     if (not creds.valid or creds.expired) and creds.refresh_token:
         creds.refresh(Request())

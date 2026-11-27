@@ -1,50 +1,43 @@
-# Gmail Inbox Triage Service (GCP Serverless)
+# Gmail Inbox Triage Service (GCP Serverless · Phase 2 Interactive Bot)
 
-A read-only, serverless Gmail inbox triage service running on **Google Cloud Platform** (**Cloud Run Jobs** + **Cloud Scheduler** at **5:30 AM Pacific Time / `America/Los_Angeles`**) and posting an actionable **Slack Block Kit** digest via an Incoming Webhook.
+A serverless Gmail inbox triage & interactive Slack assistant on **Google Cloud Platform**:
+- **5:30 AM Pacific Scheduled Triage (`Cloud Run Job` + `Cloud Scheduler`)**: Triages unread Gmail threads through a concurrent 3-tier `google-genai` funnel (**`gemini-3.5-flash-lite` → `gemini-4-carbon` → `gemini-4-neon`**) and posts interactive Block Kit cards to Slack.
+- **1-Click Slack Actions (`Cloud Run Service` + `Cloud Tasks` + `Firestore`)**:
+  - **✅ Archive**: Removes `INBOX` + `UNREAD` in Gmail and updates the Slack card in place.
+  - **📝 Draft Reply**: Uses `gemini-4-neon` to save a ready-to-send reply in **Gmail Drafts** (never auto-sends) and posts a preview + Gmail link in the Slack thread.
+  - **📅 Task / Event**: Uses `gemini-4-carbon` to create a **Google Calendar Event** or **Google Task** and replies in the thread with a direct link.
+  - **🔇 Mute Sender**: Adds the sender to Firestore `triage_muted_senders` so future runs filter them with zero LLM tokens.
+- **On-Demand `/triage` Slash Command**: `/triage`, `/triage 48h`, `/triage muted`, `/triage unmute <email>`.
 
-*(Looking for the local GPU `barcalinux` edition with Inkling-2-Mini + Ollama? Check out the `barcalinux` branch or tag `v0.1.0-local`.)*
+*(Looking for the local GPU `barcalinux` edition with Inkling-2-Mini + Ollama? Check out branch `barcalinux` or tag `v0.1.0-local`.)*
 
-## Architecture (3-Tier Strength-Matched Gemini Funnel)
+## Setup & Deploy (Phase 2)
 
-All model calls use the official **`google-genai` Python SDK** (defaulting to `GEMINI_API_KEY` via Secret Manager, with `USE_VERTEXAI=true` supported as a 1-line toggle for keyless Vertex AI IAM):
-
-1. **Stage 0 (Gmail API + Firestore)**: Fetches unread inbox threads since the last Firestore watermark, deduplicates by `(thread_id, last_message_id)`, cleans HTML, and keeps raw image/audio/PDF bytes for native Gemini multimodal input.
-2. **Stage 1 (`gemini-3.5-flash-lite`, concurrent)**: Ultra-fast bulk classification (`URGENT`, `ACTION_REQUIRED`, `TECHNICAL_ALERT`, `FYI`, `NEWSLETTER`, `PROMO_NOISE`); drops noise early.
-3. **Stage 2 (`gemini-4-carbon`, concurrent, native multimodal)**: Extracts structured CI/PR/monitoring alerts and performs deep action-item, deadline, reply-point, and native attachment analysis (images, audio, and PDFs via `types.Part.from_bytes`).
-4. **Stage 3 (`gemini-4-neon`, `max_output_tokens=8192`)**: Synthesizes the cross-thread morning `ExecutiveBriefing` and runs authoritative `HighStakesReview` on any flagged or low-confidence threads.
-
-## Quickstart (Local Dev & Testing)
-
+### 1. Re-Authorize Google Workspace OAuth (`gmail.modify`, `calendar.events`, `tasks`)
 ```bash
+cd /home/ludo/projects/gmailInboxTriage
 uv sync
-cp .env.example .env
-# Fill in GEMINI_API_KEY, SLACK_WEBHOOK_URL, and run one-time OAuth:
 uv run triage auth
-
-# Verify health & dry-run using local SQLite state:
-uv run triage check-health --local-state
-uv run triage run --dry-run --local-state --since-hours 24
 ```
 
-## Deploy to GCP (`gmail-inbox-triage-515705`)
+### 2. Configure Your Slack App (https://api.slack.com/apps)
+1. **OAuth & Permissions → Bot Token Scopes**: add `chat:write` and `commands`, install/reinstall to workspace, copy the **Bot User OAuth Token** (`xoxb-...`), and invite the bot to your channel (`/invite @Gmail Inbox Triage`).
+2. **Basic Information → App Credentials**: copy **Signing Secret**.
+3. Put `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, and `SLACK_SIGNING_SECRET` (plus optional `SLACK_ALLOWED_USER_IDS`) in `.env`.
 
-1. Ensure `gcloud` is authenticated (`gcloud auth login`) and billing is linked to `gmail-inbox-triage-515705`.
-2. Export your secrets (or ensure they exist in Secret Manager) and run the idempotent deploy script:
-   ```bash
-   chmod +x deploy/gcp/deploy.sh
-   source .env
-   ./deploy/gcp/deploy.sh
-   ```
-   *(To use keyless Vertex AI IAM instead of `GEMINI_API_KEY`, run `USE_VERTEXAI=true ./deploy/gcp/deploy.sh`.)*
-3. Trigger an immediate test execution in Cloud Run:
-   ```bash
-   gcloud run jobs execute gmail-inbox-triage --region us-west1 --wait
-   ```
-4. Once confirmed, disable the old local `barcalinux` timer so you don't receive duplicate digests:
-   ```bash
-   systemctl --user disable --now gmail-triage.timer
-   ```
+### 3. Deploy to GCP (`gmail-inbox-triage-515705`)
+```bash
+export SLACK_BOT_TOKEN=... SLACK_CHANNEL_ID=... SLACK_SIGNING_SECRET=... GEMINI_API_KEY=...
+./deploy/gcp/deploy.sh
+```
+The script deploys **both** the `gmail-inbox-triage` Cloud Run Job and the `gmail-inbox-triage-bot` Cloud Run Service, and prints the exact URLs to paste into your Slack App:
+- **Interactivity & Shortcuts → Request URL**: `https://<service-url>/slack/interactions`
+- **Slash Commands → `/triage` Request URL**: `https://<service-url>/slack/commands`
 
-## GitHub Actions Auto-Deploy
-
-`.github/workflows/deploy.yml` runs `ruff` and `pytest` on every push/PR. To enable Heroku-style auto-deploy on push to `main`, set repository variable `ENABLE_GCP_DEPLOY=true` and secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`.
+### 4. Local Development & Testing
+```bash
+uv run triage check-health --local-state
+uv run triage run --dry-run --local-state --since-hours 48
+uv run triage serve --port 8080
+uv run ruff check src tests && uv run pytest -v
+```

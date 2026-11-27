@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from google.cloud.firestore_v1 import Query
 
 from inbox_triage.config import Settings
@@ -132,6 +133,35 @@ class TestSQLiteStateStore:
         )
         assert store.get_watermark_epoch() == 0
 
+    def test_muted_senders_crud_and_normalization(self, tmp_path: Path) -> None:
+        store = SQLiteStateStore(tmp_path / "state.db")
+        assert store.get_muted_senders() == set()
+        assert store.list_muted_senders() == []
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            store.mute_sender("   ")
+
+        store.mute_sender("  Promo@Deals.EXAMPLE ", reason="Marketing noise")
+        store.mute_sender("newsletter@daily.example", reason="Digest")
+        # Re-muting same address (case-insensitive) updates in place without duplicating
+        store.mute_sender("PROMO@deals.example", reason="Updated reason")
+
+        muted_set = store.get_muted_senders()
+        assert muted_set == {"promo@deals.example", "newsletter@daily.example"}
+
+        listed = store.list_muted_senders()
+        assert len(listed) == 2
+        by_email = {m.sender_email: m for m in listed}
+        assert by_email["promo@deals.example"].reason == "Updated reason"
+        assert by_email["newsletter@daily.example"].reason == "Digest"
+        assert listed[0].muted_at >= listed[1].muted_at
+
+        # Unmute existing (with mixed case/whitespace) returns True; absent returns False
+        assert store.unmute_sender("  PROMO@DEALS.EXAMPLE ") is True
+        assert store.unmute_sender("promo@deals.example") is False
+        assert store.unmute_sender("never-muted@example.com") is False
+        assert store.get_muted_senders() == {"newsletter@daily.example"}
+
 
 class TestFirestoreStateStore:
     def test_get_watermark_epoch_queries_descending_with_5min_overlap(self) -> None:
@@ -231,6 +261,61 @@ class TestFirestoreStateStore:
         assert t2_payload["category"] == "FYI"
 
         mock_batch.commit.assert_called_once()
+
+    def test_muted_senders_crud_and_normalization(self) -> None:
+        mock_db = MagicMock()
+        muted_col = mock_db.collection.return_value
+        doc_ref = muted_col.document.return_value
+        store = FirestoreStateStore(project_id="proj-1", client=mock_db)
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            store.mute_sender("   ")
+
+        # mute_sender normalizes email and writes to triage_muted_senders
+        store.mute_sender("  Noisy@Vendor.EXAMPLE  ", reason="Slack button")
+        mock_db.collection.assert_called_with("triage_muted_senders")
+        muted_col.document.assert_called_with("noisy@vendor.example")
+        set_payload = doc_ref.set.call_args.args[0]
+        assert set_payload["sender_email"] == "noisy@vendor.example"
+        assert set_payload["reason"] == "Slack button"
+        assert isinstance(set_payload["muted_at"], str)
+
+        # get_muted_senders & list_muted_senders parse streamed docs and sort descending
+        doc_old = SimpleNamespace(
+            id="older@example.com",
+            to_dict=lambda: {
+                "sender_email": "OLDER@Example.com",
+                "muted_at": "2026-04-14T10:00:00+00:00",
+                "reason": "Old",
+            },
+        )
+        doc_new = SimpleNamespace(
+            id="newer@example.com",
+            to_dict=lambda: {
+                "sender_email": "newer@example.com",
+                "muted_at": "2026-04-15T12:00:00+00:00",
+                "reason": "New",
+            },
+        )
+        muted_col.stream.side_effect = [[doc_old, doc_new], [doc_old, doc_new]]
+
+        assert store.get_muted_senders() == {"older@example.com", "newer@example.com"}
+        listed = store.list_muted_senders()
+        assert [m.sender_email for m in listed] == ["newer@example.com", "older@example.com"]
+        assert listed[0].reason == "New"
+        assert listed[1].reason == "Old"
+
+        # unmute_sender returns True and deletes when doc exists
+        doc_ref.get.return_value = SimpleNamespace(exists=True)
+        assert store.unmute_sender("  NOISY@Vendor.example ") is True
+        muted_col.document.assert_called_with("noisy@vendor.example")
+        doc_ref.delete.assert_called_once()
+
+        # unmute_sender returns False and does not delete when doc is absent
+        doc_ref.delete.reset_mock()
+        doc_ref.get.return_value = SimpleNamespace(exists=False)
+        assert store.unmute_sender("missing@vendor.example") is False
+        doc_ref.delete.assert_not_called()
 
 
 class TestCreateStateStoreFactory:

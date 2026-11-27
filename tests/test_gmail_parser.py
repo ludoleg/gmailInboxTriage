@@ -12,7 +12,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from inbox_triage.config import Settings
-from inbox_triage.gmail.auth import SCOPES, get_gmail_credentials
+from inbox_triage.gmail.auth import (
+    CALENDAR_EVENTS_SCOPE,
+    GMAIL_MODIFY_SCOPE,
+    SCOPES,
+    TASKS_SCOPE,
+    get_gmail_credentials,
+)
 from inbox_triage.gmail.client import (
     MAX_ATTACHMENTS_PER_THREAD,
     MAX_AUDIO_BYTES,
@@ -329,8 +335,35 @@ class TestParseGmailThread:
         assert thread.attachments[0].note == "Non-analyzed attachment type"
         assert len(thread.multimodal_attachments) == MAX_ATTACHMENTS_PER_THREAD - 1
 
+    def test_extracts_rfc_message_id_from_latest_message(self) -> None:
+        raw = {
+            "id": "thr-rfc",
+            "messages": [
+                _make_raw_message(
+                    msg_id="m1",
+                    extra_headers=[{"name": "Message-ID", "value": "<first@example.com>"}],
+                ),
+                _make_raw_message(
+                    msg_id="m2",
+                    extra_headers=[{"name": "Message-Id", "value": "<latest-123@example.com>"}],
+                ),
+            ],
+        }
+        thread = parse_gmail_thread(raw)
+        assert thread.rfc_message_id == "<latest-123@example.com>"
+
+    def test_rfc_message_id_is_none_when_header_absent(self) -> None:
+        raw = {"id": "thr-no-rfc", "messages": [_make_raw_message(msg_id="m1")]}
+        thread = parse_gmail_thread(raw)
+        assert thread.rfc_message_id is None
+
 
 class TestGmailCredentials:
+    def test_phase2_scopes_include_gmail_modify_calendar_and_tasks(self) -> None:
+        assert GMAIL_MODIFY_SCOPE in SCOPES
+        assert CALENDAR_EVENTS_SCOPE in SCOPES
+        assert TASKS_SCOPE in SCOPES
+
     def test_loads_from_env_json_and_refreshes_in_memory_without_writing_disk(
         self, tmp_path: Path
     ) -> None:
@@ -362,7 +395,7 @@ class TestGmailCredentials:
         ) as mock_from_info:
             creds = get_gmail_credentials(token_path, token_json=token_json)
 
-        mock_from_info.assert_called_once_with(json.loads(token_json), SCOPES)
+        mock_from_info.assert_called_once_with(json.loads(token_json))
         fake_creds.refresh.assert_called_once()
         assert creds is fake_creds
         # Crucial for Cloud Run Jobs: must NEVER write to disk when loaded from GMAIL_TOKEN_JSON
@@ -391,7 +424,7 @@ class TestGmailCredentials:
         ) as mock_from_file:
             creds = get_gmail_credentials(token_path, token_json=None)
 
-        mock_from_file.assert_called_once_with(str(token_path), SCOPES)
+        mock_from_file.assert_called_once_with(str(token_path))
         fake_creds.refresh.assert_called_once()
         assert creds is fake_creds
         assert token_path.read_text(encoding="utf-8") == '{"token": "fresh-local"}'

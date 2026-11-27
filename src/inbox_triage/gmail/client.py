@@ -1,4 +1,4 @@
-"""Read-only Gmail thread fetching with native Gemini multimodal attachment pass-through."""
+"""Gmail thread fetching, native multimodal pass-through, archive, and reply draft creation."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import base64
 import logging
 import re
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
 
@@ -147,6 +148,7 @@ def parse_gmail_thread(
         latest_headers.get("from") or first_headers.get("from") or ""
     )
     received_at = _parse_received_at(latest_headers, latest_msg.get("internalDate"))
+    rfc_message_id = latest_headers.get("message-id") or None
 
     has_unsub = False
     is_auto = False
@@ -256,6 +258,7 @@ def parse_gmail_thread(
     return EmailThread(
         thread_id=thread_id,
         last_message_id=latest_msg["id"],
+        rfc_message_id=rfc_message_id,
         subject=subject,
         sender=sender_label,
         sender_email=sender_email,
@@ -272,7 +275,7 @@ def parse_gmail_thread(
 
 
 class GmailClient:
-    """Read-only Gmail API client using gmail.readonly scope."""
+    """Gmail API client supporting thread fetch, archive/mark-read, and reply drafts."""
 
     def __init__(self, settings: Settings, service: Any | None = None) -> None:
         self.settings = settings
@@ -298,6 +301,16 @@ class GmailClient:
         )
         data = resp.get("data")
         return decode_urlsafe_b64(data) if data else None
+
+    def get_thread(self, thread_id: str) -> EmailThread:
+        """Fetch and parse a single Gmail thread by ID."""
+        raw = (
+            self.service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="full")
+            .execute()
+        )
+        return parse_gmail_thread(raw, attachment_fetcher=self._fetch_attachment_bytes)
 
     def fetch_unread_threads(
         self,
@@ -329,13 +342,51 @@ class GmailClient:
             if not page_token:
                 break
 
-        threads: list[EmailThread] = []
-        for tid in thread_ids[:limit]:
-            raw = (
-                self.service.users()
-                .threads()
-                .get(userId="me", id=tid, format="full")
-                .execute()
+        return [self.get_thread(tid) for tid in thread_ids[:limit]]
+
+    def archive_and_mark_read(self, thread_id: str) -> None:
+        """Remove INBOX and UNREAD labels from a Gmail thread."""
+        self.service.users().threads().modify(
+            userId="me",
+            id=thread_id,
+            body={"removeLabelIds": ["INBOX", "UNREAD"]},
+        ).execute()
+        logger.info("Archived and marked read Gmail thread %s.", thread_id)
+
+    def create_reply_draft(
+        self,
+        *,
+        thread_id: str,
+        to_email: str,
+        subject: str,
+        body_text: str,
+        in_reply_to: str | None = None,
+    ) -> tuple[str, str]:
+        """Save a plain-text reply into Gmail Drafts (never auto-sends).
+
+        Returns (draft_id, gmail_draft_url).
+        """
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        msg = EmailMessage()
+        msg["To"] = to_email
+        msg["Subject"] = reply_subject
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+        msg.set_content(body_text)
+
+        raw_encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+        resp = (
+            self.service.users()
+            .drafts()
+            .create(
+                userId="me",
+                body={"message": {"raw": raw_encoded, "threadId": thread_id}},
             )
-            threads.append(parse_gmail_thread(raw, attachment_fetcher=self._fetch_attachment_bytes))
-        return threads
+            .execute()
+        )
+        draft_id = str(resp.get("id") or "")
+        msg_id = str((resp.get("message") or {}).get("id") or draft_id)
+        draft_url = f"https://mail.google.com/mail/u/0/#drafts?compose={msg_id}"
+        logger.info("Created Gmail reply draft %s for thread %s.", draft_id, thread_id)
+        return draft_id, draft_url

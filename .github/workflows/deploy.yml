@@ -1,4 +1,4 @@
-name: CI & Deploy Cloud Run Job
+name: CI & Deploy Cloud Run Job + Interactive Bot
 
 on:
   push:
@@ -15,6 +15,7 @@ env:
   GCP_REGION: us-west1
   ARTIFACT_REPO: gmail-triage
   CLOUD_RUN_JOB: gmail-inbox-triage
+  CLOUD_RUN_SERVICE: gmail-inbox-triage-bot
 
 jobs:
   test:
@@ -47,8 +48,8 @@ jobs:
           docker build -t "${IMAGE}" -t "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${CLOUD_RUN_JOB}:latest" .
           docker push "${IMAGE}"
           docker push "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${CLOUD_RUN_JOB}:latest"
-      - name: Update Cloud Run Job
+      - name: Update Cloud Run Job & Interactive Service
         run: |
-          gcloud run jobs update "${CLOUD_RUN_JOB}" \
-            --region "${GCP_REGION}" \
-            --image "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${CLOUD_RUN_JOB}:${GITHUB_SHA}"
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPO}/${CLOUD_RUN_JOB}:${GITHUB_SHA}"
+          gcloud run jobs update "${CLOUD_RUN_JOB}" --region "${GCP_REGION}" --image "${IMAGE}"
+          gcloud run services update "${CLOUD_RUN_SERVICE}" --region "${GCP_REGION}" --image "${IMAGE}"

@@ -1,4 +1,4 @@
-"""Application configuration for GCP Cloud Run Jobs and local development."""
+"""Application configuration for GCP Cloud Run Jobs/Services and local development."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed settings for the serverless GCP Gmail inbox triage service."""
+    """Typed settings for the serverless GCP Gmail inbox triage & interactive Slack bot."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -24,9 +24,16 @@ class Settings(BaseSettings):
 
     # GCP & GenAI Backend
     gcp_project_id: str = Field(default="gmail-inbox-triage-515705", alias="GCP_PROJECT_ID")
+    gcp_region: str = Field(default="us-west1", alias="GCP_REGION")
     use_vertexai: bool = Field(default=False, alias="USE_VERTEXAI")
     vertex_location: str = Field(default="global", alias="VERTEX_LOCATION")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
+
+    # Cloud Run & Cloud Tasks (Phase 2 Interactive Bot)
+    cloud_run_job_name: str = Field(default="gmail-inbox-triage", alias="CLOUD_RUN_JOB_NAME")
+    cloud_run_service_url: str | None = Field(default=None, alias="CLOUD_RUN_SERVICE_URL")
+    cloud_tasks_queue: str | None = Field(default=None, alias="CLOUD_TASKS_QUEUE")
+    internal_task_secret: str | None = Field(default=None, alias="INTERNAL_TASK_SECRET")
 
     # 3-Tier Strength-Matched Model Funnel
     model_stage1_fast: str = Field(default="gemini-3.5-flash-lite", alias="MODEL_STAGE1_FAST")
@@ -46,7 +53,7 @@ class Settings(BaseSettings):
         alias="STATE_DB_PATH",
     )
 
-    # Gmail Read-Only OAuth
+    # Google Workspace OAuth (gmail.modify + calendar.events + tasks)
     gmail_token_json: str | None = Field(default=None, alias="GMAIL_TOKEN_JSON")
     gmail_credentials_path: Path = Field(
         default=Path("/home/ludo/projects/gmailInboxTriage/credentials.json"),
@@ -60,7 +67,11 @@ class Settings(BaseSettings):
     gmail_max_threads: int = Field(default=60, alias="GMAIL_MAX_THREADS")
     default_lookback_hours: int = Field(default=24, alias="DEFAULT_LOOKBACK_HOURS")
 
-    # Slack Incoming Webhook
+    # Slack Delivery & Interactivity
+    slack_bot_token: str | None = Field(default=None, alias="SLACK_BOT_TOKEN")
+    slack_channel_id: str | None = Field(default=None, alias="SLACK_CHANNEL_ID")
+    slack_signing_secret: str | None = Field(default=None, alias="SLACK_SIGNING_SECRET")
+    slack_allowed_user_ids: str = Field(default="", alias="SLACK_ALLOWED_USER_IDS")
     slack_webhook_url: str | None = Field(default=None, alias="SLACK_WEBHOOK_URL")
     slack_mention_on_urgent: str | None = Field(default=None, alias="SLACK_MENTION_ON_URGENT")
 
@@ -73,3 +84,11 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def allowed_slack_user_set(self) -> set[str]:
+        return {u.strip() for u in self.slack_allowed_user_ids.split(",") if u.strip()}
+
+    @property
+    def has_slack_bot(self) -> bool:
+        return bool(self.slack_bot_token and self.slack_channel_id)

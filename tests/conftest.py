@@ -100,6 +100,7 @@ def make_email_thread(
     *,
     thread_id: str = "t-001",
     last_message_id: str = "m-001",
+    rfc_message_id: str | None = None,
     subject: str = "Test Subject",
     sender: str = "Alice Example",
     sender_email: str = "alice@example.com",
@@ -121,6 +122,7 @@ def make_email_thread(
     return EmailThread(
         thread_id=thread_id,
         last_message_id=last_message_id,
+        rfc_message_id=rfc_message_id,
         subject=subject,
         sender=sender,
         sender_email=sender_email,

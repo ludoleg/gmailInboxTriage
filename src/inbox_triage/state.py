@@ -9,17 +9,29 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from inbox_triage.config import Settings
-from inbox_triage.models import TriageRunReport
+from inbox_triage.models import MutedSender, TriageRunReport
 
 
 class StateStore(Protocol):
-    """Contract for watermark tracking and processed-thread idempotency."""
+    """Contract for watermark tracking, processed-thread idempotency, and muted senders."""
 
     def get_watermark_epoch(self, default_lookback_hours: int = 24) -> int: ...
 
     def is_already_processed(self, thread_id: str, last_message_id: str) -> bool: ...
 
     def record_run(self, report: TriageRunReport) -> None: ...
+
+    def mute_sender(self, sender_email: str, reason: str | None = None) -> None: ...
+
+    def unmute_sender(self, sender_email: str) -> bool: ...
+
+    def get_muted_senders(self) -> set[str]: ...
+
+    def list_muted_senders(self) -> list[MutedSender]: ...
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
 
 
 class SQLiteStateStore:
@@ -55,6 +67,12 @@ class SQLiteStateStore:
                     category TEXT NOT NULL,
                     processed_at TEXT NOT NULL,
                     run_id TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS muted_senders (
+                    sender_email TEXT PRIMARY KEY,
+                    muted_at TEXT NOT NULL,
+                    reason TEXT
                 );
                 """
             )
@@ -116,12 +134,52 @@ class SQLiteStateStore:
                     ),
                 )
 
+    def mute_sender(self, sender_email: str, reason: str | None = None) -> None:
+        norm = _normalize_email(sender_email)
+        if not norm:
+            raise ValueError("sender_email must not be empty.")
+        now_iso = datetime.now(UTC).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO muted_senders (sender_email, muted_at, reason)
+                VALUES (?, ?, ?)
+                """,
+                (norm, now_iso, reason),
+            )
+
+    def unmute_sender(self, sender_email: str) -> bool:
+        norm = _normalize_email(sender_email)
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM muted_senders WHERE sender_email = ?", (norm,))
+            return cur.rowcount > 0
+
+    def get_muted_senders(self) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT sender_email FROM muted_senders").fetchall()
+        return {str(r["sender_email"]).lower() for r in rows}
+
+    def list_muted_senders(self) -> list[MutedSender]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT sender_email, muted_at, reason FROM muted_senders ORDER BY muted_at DESC"
+            ).fetchall()
+        return [
+            MutedSender(
+                sender_email=r["sender_email"],
+                muted_at=datetime.fromisoformat(r["muted_at"]),
+                reason=r["reason"],
+            )
+            for r in rows
+        ]
+
 
 class FirestoreStateStore:
-    """Serverless GCP Firestore store for Cloud Run Jobs."""
+    """Serverless GCP Firestore store for Cloud Run Jobs & Services."""
 
     RUNS_COLLECTION = "triage_runs"
     THREADS_COLLECTION = "triage_processed_threads"
+    MUTED_COLLECTION = "triage_muted_senders"
 
     def __init__(
         self,
@@ -173,6 +231,7 @@ class FirestoreStateStore:
                 "completed_at": now_iso,
                 "watermark_epoch": watermark_epoch,
                 "total_threads": report.total_threads_fetched,
+                "muted_skipped": report.muted_skipped_count,
                 "deep_reviews": report.deep_reviews_count,
                 "total_prompt_tokens": report.total_prompt_tokens,
                 "total_completion_tokens": report.total_completion_tokens,
@@ -192,6 +251,60 @@ class FirestoreStateStore:
                 },
             )
         batch.commit()
+
+    def mute_sender(self, sender_email: str, reason: str | None = None) -> None:
+        norm = _normalize_email(sender_email)
+        if not norm:
+            raise ValueError("sender_email must not be empty.")
+        self._db.collection(self.MUTED_COLLECTION).document(norm).set(
+            {
+                "sender_email": norm,
+                "muted_at": datetime.now(UTC).isoformat(),
+                "reason": reason,
+            }
+        )
+
+    def unmute_sender(self, sender_email: str) -> bool:
+        norm = _normalize_email(sender_email)
+        ref = self._db.collection(self.MUTED_COLLECTION).document(norm)
+        doc = ref.get()
+        if not doc.exists:
+            return False
+        ref.delete()
+        return True
+
+    def get_muted_senders(self) -> set[str]:
+        docs = self._db.collection(self.MUTED_COLLECTION).stream()
+        out: set[str] = set()
+        for doc in docs:
+            data = doc.to_dict() or {}
+            email = data.get("sender_email") or getattr(doc, "id", "")
+            if email:
+                out.add(str(email).lower())
+        return out
+
+    def list_muted_senders(self) -> list[MutedSender]:
+        docs = self._db.collection(self.MUTED_COLLECTION).stream()
+        items: list[MutedSender] = []
+        for doc in docs:
+            data = doc.to_dict() or {}
+            email = data.get("sender_email") or getattr(doc, "id", "")
+            muted_at_raw = data.get("muted_at")
+            muted_at = (
+                datetime.fromisoformat(muted_at_raw)
+                if isinstance(muted_at_raw, str)
+                else datetime.now(UTC)
+            )
+            if email:
+                items.append(
+                    MutedSender(
+                        sender_email=str(email).lower(),
+                        muted_at=muted_at,
+                        reason=data.get("reason"),
+                    )
+                )
+        items.sort(key=lambda m: m.muted_at, reverse=True)
+        return items
 
 
 def create_state_store(settings: Settings, *, force_sqlite: bool = False) -> StateStore:
